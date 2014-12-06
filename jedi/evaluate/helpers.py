@@ -157,6 +157,8 @@ def search_call_signatures(user_stmt, position):
     """
     debug.speed('func_call start')
     call, arr, index = None, None, 0
+    if isinstance(user_stmt, pr.KeywordStatement):
+        user_stmt = user_stmt.stmt
     if user_stmt is not None and isinstance(user_stmt, pr.ExprStmt):
         # some parts will of the statement will be removed
         user_stmt = deep_ast_copy(user_stmt)

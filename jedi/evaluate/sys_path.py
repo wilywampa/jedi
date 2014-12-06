@@ -46,50 +46,57 @@ def _execute_code(module_path, code):
         return None
 
 
-def _paths_from_assignment(statement):
+def _paths_from_assignment(evaluator, statement):
     """
-    extracts the assigned strings from an assignment that looks as follows::
+    Extracts the assigned strings from an assignment that looks as follows::
 
     >>> sys.path[0:0] = ['module/path', 'another/module/path']
-    """
 
-    names = statement.get_defined_names()
-    if len(names) != 1:
-        return []
-    if [unicode(x) for x in names[0].names] != ['sys', 'path']:
-        return []
-    expressions = statement.expression_list()
-    if len(expressions) != 1 or not isinstance(expressions[0], pr.Array):
-        return
-    stmts = (s for s in expressions[0].values if isinstance(s, pr.Statement))
-    expression_lists = (s.expression_list() for s in stmts)
-    return [e.value for exprs in expression_lists for e in exprs
-            if isinstance(e, pr.Literal) and e.value]
+    This function is in general pretty tolerant (and therefore 'buggy').
+    However, it's not a big issue usually to add more paths to Jedi's sys_path,
+    because it will only affect Jedi in very random situations and by adding
+    more paths than necessary, it usually benefits the general user.
+    """
+    for exp_list, operator in statement.assignment_details:
+        if len(exp_list) != 1 or not isinstance(exp_list[0], pr.Call):
+            continue
+        if exp_list[0].names() != ['sys', 'path']:
+            continue
+        # TODO at this point we ignore all ways what could be assigned to
+        # sys.path or an execution of it. Here we could do way more
+        # complicated checks.
+
+        from jedi.evaluate.iterable import get_iterator_types
+        from jedi.evaluate.precedence import is_string
+        for val in get_iterator_types(evaluator.eval_statement(statement)):
+            if is_string(val):
+                yield val.obj
 
 
 def _paths_from_insert(module_path, exe):
     """ extract the inserted module path from an "sys.path.insert" statement
     """
     exe_type, exe.type = exe.type, pr.Array.NOARRAY
-    exe_pop = exe.values.pop(0)
-    res = _execute_code(module_path, exe.get_code())
-    exe.type = exe_type
+    try:
+        exe_pop = exe.values.pop(0)
+        res = _execute_code(module_path, exe.get_code())
+    finally:
+        exe.type = exe_type
     exe.values.insert(0, exe_pop)
     return res
 
 
 def _paths_from_call_expression(module_path, call):
     """ extract the path from either "sys.path.append" or "sys.path.insert" """
-    if call.execution is None:
-        return
-    n = call.name
-    if not isinstance(n, pr.Name) or len(n.names) != 3:
-        return
-    names = [unicode(x) for x in n.names]
-    if names[:2] != ['sys', 'path']:
-        return
+    names = call.names()
+    if names[:3] != ['sys', 'path', 'append'] and names[:3] != ['sys', 'path', 'insert']:
+        return []
+    if not call.next.next.next_is_execution():
+        return []
+
     cmd = names[2]
-    exe = call.execution
+    exe = call.next.next.next
+    path = None
     if cmd == 'insert' and len(exe) == 2:
         path = _paths_from_insert(module_path, exe)
     elif cmd == 'append' and len(exe) == 1:
@@ -97,23 +104,21 @@ def _paths_from_call_expression(module_path, call):
     return path and [path] or []
 
 
-def _check_module(module):
+def _check_module(evaluator, module):
     try:
         possible_stmts = module.used_names['path']
     except KeyError:
         return get_sys_path()
     sys_path = list(get_sys_path())  # copy
-    statements = (p for p in possible_stmts if isinstance(p, pr.Statement))
+    statements = (p for p in possible_stmts if isinstance(p, pr.ExprStmt))
     for stmt in statements:
         expressions = stmt.expression_list()
         if len(expressions) == 1 and isinstance(expressions[0], pr.Call):
             sys_path.extend(
                 _paths_from_call_expression(module.path, expressions[0]) or [])
-        elif (
-            hasattr(stmt, 'assignment_details') and
-            len(stmt.assignment_details) == 1
-        ):
-            sys_path.extend(_paths_from_assignment(stmt) or [])
+        elif hasattr(stmt, 'assignment_details') \
+                and len(stmt.assignment_details) == 1:
+            sys_path.extend(_paths_from_assignment(evaluator, stmt))
     return sys_path
 
 
@@ -128,7 +133,7 @@ def sys_path_with_modifications(evaluator, module):
     with common.ignored(OSError):
         os.chdir(os.path.dirname(module.path))
 
-    result = _check_module(module)
+    result = _check_module(evaluator, module)
     result += _detect_django_path(module.path)
     # buildout scripts often contain the same sys.path modifications
     # the set here is used to avoid duplicate sys.path entries

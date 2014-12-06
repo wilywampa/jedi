@@ -78,29 +78,34 @@ def search_params(evaluator, param):
                     pos = c.start_pos
                     scope = stmt.parent
 
-                    # this whole stuff is just to not execute certain parts
+                    # This whole stuff is just to not execute certain parts
                     # (speed improvement), basically we could just call
-                    # ``eval_call_path`` on the call_path and it would
-                    # also work.
+                    # ``eval_call_path`` on the call_path and it would also
+                    # work.
                     def listRightIndex(lst, value):
                         return len(lst) - lst[-1::-1].index(value) - 1
 
                     # Need to take right index, because there could be a
                     # func usage before.
-                    call_path_simple = [unicode(d) if isinstance(d, pr.NamePart)
+                    call_path_simple = [unicode(d) if isinstance(d, pr.Name)
                                         else d for d in call_path]
                     i = listRightIndex(call_path_simple, func_name)
-                    first, last = call_path[:i], call_path[i + 1:]
-                    if not last and not call_path_simple.index(func_name) != i:
+                    before, after = call_path[:i], call_path[i + 1:]
+                    if not after and not call_path_simple.index(func_name) != i:
                         continue
                     scopes = [scope]
-                    if first:
-                        scopes = evaluator.eval_call_path(iter(first), c.parent, pos)
+                    if before:
+                        scopes = evaluator.eval_call_path(iter(before), c.parent, pos)
                         pos = None
                     from jedi.evaluate import representation as er
                     for scope in scopes:
+                        # Not resolving decorators is a speed hack:
+                        # By ignoring them, we get the function that is
+                        # probably called really fast. If it's not called, it
+                        # doesn't matter. But this is a way to get potential
+                        # candidates for calling that function really quick!
                         s = evaluator.find_types(scope, func_name, position=pos,
-                                                 search_global=not first,
+                                                 search_global=not before,
                                                  resolve_decorator=False)
 
                         c = [getattr(escope, 'base_func', None) or escope.base
@@ -109,14 +114,14 @@ def search_params(evaluator, param):
                         if compare in c:
                             # only if we have the correct function we execute
                             # it, otherwise just ignore it.
-                            evaluator.follow_path(iter(last), s, scope)
+                            evaluator.follow_path(iter(after), s, scope)
             return listener.param_possibilities
 
         result = []
         for params in get_posibilities(evaluator, module, func_name):
             for p in params:
                 if str(p) == param_name:
-                    result += evaluator.eval_statement(p.parent)
+                    result += evaluator.eval_statement(p.get_definition())
         return result
 
     func = param.get_parent_until(pr.Function)
@@ -140,14 +145,15 @@ def search_params(evaluator, param):
     listener = ParamListener()
     func.listeners.add(listener)
 
-    result = []
-    # This is like backtracking: Get the first possible result.
-    for mod in imports.get_modules_containing_name([current_module], func_name):
-        result = get_params_for_module(mod)
-        if result:
-            break
-
-    # cleanup: remove the listener; important: should not stick.
-    func.listeners.remove(listener)
+    try:
+        result = []
+        # This is like backtracking: Get the first possible result.
+        for mod in imports.get_modules_containing_name([current_module], func_name):
+            result = get_params_for_module(mod)
+            if result:
+                break
+    finally:
+        # cleanup: remove the listener; important: should not stick.
+        func.listeners.remove(listener)
 
     return result

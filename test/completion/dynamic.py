@@ -2,7 +2,9 @@
 This is used for dynamic object completion.
 Jedi tries to guess the types with a backtracking approach.
 """
-def func(a):
+def func(a, default_arg=2):
+    #? int()
+    default_arg
     #? int() str()
     return a
 
@@ -318,8 +320,8 @@ blub()[0]
 
 # with else clause
 def blub():
-    if 1:
-        1
+    if random.choice([0, 1]):
+         1
     else:
         a = []
         a.append(1)

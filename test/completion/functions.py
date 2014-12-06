@@ -21,7 +21,7 @@ arr
 def inputs(param):
     return param
 
-#? list()
+#? list
 inputs(list)
 
 def variable_middle():
@@ -96,11 +96,13 @@ def other(a):
     return recursion2(a)
 
 def recursion2(a):
-    if a:
+    if random.choice([0, 1]):
         return other(a)
     else:
-        return recursion2("")
-    return a
+        if random.choice([0, 1]):
+            return recursion2("")
+        else:
+            return a
 
 #? int() str()
 recursion2(1)
@@ -205,7 +207,7 @@ exe[0]
 exe[1]
 
 # illegal args (TypeError)
-#? 
+#?
 args_func(*1)[0]
 # iterator
 #? int()
@@ -237,7 +239,7 @@ exe = args_func(1, "", list)
 exe[0]
 #? tuple()
 exe[1]
-#? list()
+#? list
 exe[1][1]
 
 
@@ -306,7 +308,7 @@ def fu(a=1, b="", *args, **kwargs):
 
 exe = fu(list, 1, "", c=set, d="")
 
-#? list()
+#? list
 exe[0]
 #? int()
 exe[1]
@@ -316,7 +318,7 @@ exe[2]
 exe[2][0]
 #? dict()
 exe[3]
-#? set()
+#? set
 exe[3]['c']
 
 # -----------------

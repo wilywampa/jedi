@@ -37,9 +37,10 @@ See also :attr:`Scope.subscopes` and :attr:`Scope.statements`.
 import os
 import re
 from inspect import cleandoc
+from collections import defaultdict
 
 from jedi._compatibility import (next, Python3Method, encoding, unicode,
-                                 is_py3, u, literal_eval)
+                                 is_py3, u, literal_eval, use_metaclass)
 from jedi import common
 from jedi import debug
 from jedi import cache
@@ -113,13 +114,13 @@ class Base(object):
     @property
     def newline(self):
         """Returns the newline type for the current code."""
-        #TODO: we need newline detection
+        # TODO: we need newline detection
         return "\n"
 
     @property
     def whitespace(self):
         """Returns the whitespace type for the current code: tab or space."""
-        #TODO: we need tab detection
+        # TODO: we need tab detection
         return " "
 
     @Python3Method
@@ -134,17 +135,22 @@ class Base(object):
             classes = (classes,)
         scope = self if include_current else self.parent
         while scope.parent is not None:
+            # TODO why if classes?
             if classes and reverse != scope.isinstance(*classes):
                 break
             scope = scope.parent
         return scope
 
-    def is_callable(self):
+    def get_parent_scope(self):
         """
-        By default parser objects are not callable, we make them callable by
-        the ``evaluate.representation`` objects.
+        Returns the underlying scope.
         """
-        return False
+        scope = self.parent
+        while scope.parent is not None:
+            if scope.is_scope():
+                break
+            scope = scope.parent
+        return scope
 
     def space(self, from_pos, to_pos):
         """Return the space between two tokens"""
@@ -157,6 +163,10 @@ class Base(object):
                 self.whitespace * to_pos[1],
             )
 
+    def is_scope(self):
+        # Default is not being a scope. Just inherit from Scope.
+        return False
+
 
 class Simple(Base):
     """
@@ -166,7 +176,7 @@ class Simple(Base):
     __slots__ = ('parent', '_sub_module', '_start_pos', 'use_as_parent',
                  '_end_pos')
 
-    def __init__(self, module, start_pos, end_pos=(None, None)):
+    def __init__(self, module, start_pos, end_pos=(None, None), parent=None):
         """
         Initialize :class:`Simple`.
 
@@ -181,7 +191,7 @@ class Simple(Base):
         self._start_pos = start_pos
         self._end_pos = end_pos
 
-        self.parent = None
+        self.parent = parent
         # use this attribute if parent should be something else than self.
         self.use_as_parent = self
 
@@ -212,18 +222,25 @@ class Simple(Base):
         return "<%s: %s@%s,%s>" % \
             (type(self).__name__, code, self.start_pos[0], self.start_pos[1])
 
-    def is_scope(self):
-        return False
+
+class IsScopeMeta(type):
+    def __instancecheck__(self, other):
+        return other.is_scope()
 
 
-class IsScope(Base):
-    __slots__ = ()
-
-    def is_scope(self):
-        return True
+class IsScope(use_metaclass(IsScopeMeta)):
+    pass
 
 
-class Scope(IsScope, Simple, DocstringMixin):
+def _return_empty_list():
+    """
+    Necessary for pickling. It needs to be reachable for pickle, cannot
+    be a lambda or a closure.
+    """
+    return []
+
+
+class Scope(Simple, DocstringMixin):
     """
     Super class for the parser tree, which represents the state of a python
     text file.
@@ -235,7 +252,7 @@ class Scope(IsScope, Simple, DocstringMixin):
     :type start_pos: tuple(int, int)
     """
     __slots__ = ('subscopes', 'imports', 'statements', '_doc_token', 'asserts',
-                 'returns', 'is_generator')
+                 'returns', 'is_generator', '_names_dict')
 
     def __init__(self, module, start_pos):
         super(Scope, self).__init__(module, start_pos)
@@ -247,7 +264,18 @@ class Scope(IsScope, Simple, DocstringMixin):
         # Needed here for fast_parser, because the fast_parser splits and
         # returns will be in "normal" modules.
         self.returns = []
+        self._names_dict = defaultdict(_return_empty_list)
         self.is_generator = False
+
+    def is_scope(self):
+        return True
+
+    def add_name_calls(self, name, calls):
+        """Add a name to the names_dict."""
+        self._names_dict[name] += calls
+
+    def get_names_dict(self):
+        return self._names_dict
 
     def add_scope(self, sub, decorators):
         sub.parent = self.use_as_parent
@@ -391,10 +419,12 @@ class Scope(IsScope, Simple, DocstringMixin):
                 r = r.next
 
 
-class Module(IsScope):
+class Module(Base):
     """
     For isinstance checks. fast_parser.Module also inherits from this.
     """
+    def is_scope(self):
+        return True
 
 
 class SubModule(Scope, Module):
@@ -451,11 +481,11 @@ class SubModule(Scope, Module):
         else:
             sep = (re.escape(os.path.sep),) * 2
             r = re.search(r'([^%s]*?)(%s__init__)?(\.py|\.so)?$' % sep, self.path)
-            # remove PEP 3149 names
+            # Remove PEP 3149 names
             string = re.sub('\.[a-z]+-\d{2}[mud]{0,3}$', '', r.group(1))
-        # positions are not real therefore choose (0, 0)
-        names = [(string, (0, 0))]
-        return Name(self, names, (0, 0), (0, 0), self.use_as_parent)
+        # Positions are not real, but a module starts at (1, 0)
+        p = (1, 0)
+        return Name(self, string, self.use_as_parent, p)
 
     @property
     def has_explicit_absolute_import(self):
@@ -464,10 +494,10 @@ class SubModule(Scope, Module):
         is a ``__future__`` import.
         """
         for imp in self.imports:
-            if imp.from_ns is None or imp.namespace is None:
+            if not imp.from_names or not imp.namespace_names:
                 continue
 
-            namespace, feature = imp.from_ns.names[0], imp.namespace.names[0]
+            namespace, feature = imp.from_names[0], imp.namespace_names[0]
             if unicode(namespace) == "__future__" and unicode(feature) == "absolute_import":
                 return True
 
@@ -515,9 +545,9 @@ class Class(Scope):
         if self._doc_token is not None:
             docstr = self.raw_doc
         for sub in self.subscopes:
-            if unicode(sub.name.names[-1]) == '__init__':
+            if unicode(sub.name) == '__init__':
                 return '%s\n\n%s' % (
-                    sub.get_call_signature(funcname=self.name.names[-1]), docstr)
+                    sub.get_call_signature(funcname=self.name), docstr)
         return docstr
 
     def scope_names_generator(self, position=None):
@@ -583,7 +613,7 @@ class Function(Scope):
 
         :rtype: str
         """
-        l = unicode(funcname or self.name.names[-1]) + '('
+        l = unicode(funcname or self.name) + '('
         lines = []
         for (i, p) in enumerate(self.params):
             code = p.get_code(False)
@@ -644,10 +674,11 @@ class Flow(Scope):
     :param start_pos: Position (line, column) of the Flow statement.
     :type start_pos: tuple(int, int)
     """
-    __slots__ = ('next', 'command', '_parent', 'inputs', 'set_vars')
+    __slots__ = ('next', 'previous', 'command', '_parent', 'inputs', 'set_vars')
 
     def __init__(self, module, command, inputs, start_pos):
         self.next = None
+        self.previous = None
         self.command = command
         super(Flow, self).__init__(module, start_pos)
         self._parent = None
@@ -656,6 +687,15 @@ class Flow(Scope):
         for s in inputs:
             s.parent = self.use_as_parent
         self.set_vars = []
+
+    def add_name_calls(self, name, calls):
+        """Add a name to the names_dict."""
+        parent = self.parent
+        if isinstance(parent, Module):
+            # TODO this also looks like code smell. Look for opportunities to
+            # remove.
+            parent = self._sub_module
+        parent.add_name_calls(name, calls)
 
     @property
     def parent(self):
@@ -713,6 +753,7 @@ class Flow(Scope):
         else:
             self.next = next
             self.next.parent = self.parent
+            self.next.previous = self
             return next
 
     def scope_names_generator(self, position=None):
@@ -753,27 +794,28 @@ class Import(Simple):
 
     :param start_pos: Position (line, column) of the Import.
     :type start_pos: tuple(int, int)
-    :param namespace: The import, can be empty if a star is given
-    :type namespace: Name
+    :param namespace_names: The import, can be empty if a star is given
+    :type namespace_names: list of Name
     :param alias: The alias of a namespace(valid in the current namespace).
-    :type alias: Name
-    :param from_ns: Like the namespace, can be equally used.
-    :type from_ns: Name
+    :type alias: list of Name
+    :param from_names: Like the namespace, can be equally used.
+    :type from_names: list of Name
     :param star: If a star is used -> from time import *.
     :type star: bool
     :param defunct: An Import is valid or not.
     :type defunct: bool
     """
-    def __init__(self, module, start_pos, end_pos, namespace, alias=None,
-                 from_ns=None, star=False, relative_count=0, defunct=False):
+    def __init__(self, module, start_pos, end_pos, namespace_names, alias=None,
+                 from_names=(), star=False, relative_count=0, defunct=False):
         super(Import, self).__init__(module, start_pos, end_pos)
 
-        self.namespace = namespace
+        self.namespace_names = namespace_names
         self.alias = alias
-        self.from_ns = from_ns
-        for n in namespace, alias, from_ns:
-            if n:
-                n.parent = self.use_as_parent
+        if self.alias:
+            alias.parent = self
+        self.from_names = from_names
+        for n in namespace_names + list(from_names):
+            n.parent = self.use_as_parent
 
         self.star = star
         self.relative_count = relative_count
@@ -782,20 +824,18 @@ class Import(Simple):
     def get_code(self, new_line=True):
         # in case one of the names is None
         alias = self.alias or ''
-        namespace = self.namespace or ''
-        from_ns = self.from_ns or ''
 
+        ns_str = '.'.join(unicode(n) for n in self.namespace_names)
         if self.alias:
-            ns_str = "%s as %s" % (namespace, alias)
-        else:
-            ns_str = unicode(namespace)
+            ns_str = "%s as %s" % (ns_str, alias)
 
         nl = '\n' if new_line else ''
-        if self.from_ns or self.relative_count:
+        if self.from_names or self.relative_count:
             if self.star:
                 ns_str = '*'
             dots = '.' * self.relative_count
-            return "from %s%s import %s%s" % (dots, from_ns, ns_str, nl)
+            from_txt = '.'.join(unicode(n) for n in self.from_names)
+            return "from %s%s import %s%s" % (dots, from_txt, ns_str, nl)
         else:
             return "import %s%s" % (ns_str, nl)
 
@@ -806,21 +846,18 @@ class Import(Simple):
             return [self]
         if self.alias:
             return [self.alias]
-        if len(self.namespace) > 1:
-            o = self.namespace
-            n = Name(self._sub_module, [(unicode(o.names[0]), o.start_pos)],
-                     o.start_pos, o.end_pos, parent=o.parent)
-            return [n]
+        if len(self.namespace_names) > 1:
+            return [self.namespace_names[0]]
         else:
-            return [self.namespace]
+            return self.namespace_names
 
     def get_all_import_names(self):
         n = []
-        if self.from_ns:
-            n.append(self.from_ns)
-        if self.namespace:
-            n.append(self.namespace)
-        if self.alias:
+        if self.from_names:
+            n += self.from_names
+        if self.namespace_names:
+            n += self.namespace_names
+        if self.alias is not None:
             n.append(self.alias)
         return n
 
@@ -831,8 +868,8 @@ class Import(Simple):
 
             import foo.bar
         """
-        return not self.alias and not self.from_ns and self.namespace is not None \
-            and len(self.namespace.names) > 1
+        return not self.alias and not self.from_names \
+            and len(self.namespace_names) > 1
 
 
 class KeywordStatement(Base):
@@ -850,9 +887,6 @@ class KeywordStatement(Base):
 
         if stmt is not None:
             stmt.parent = self
-
-    def is_scope(self):
-        return False
 
     def __repr__(self):
         return "<%s(%s): %s>" % (type(self).__name__, self.name, self.stmt)
@@ -894,22 +928,21 @@ class Statement(Simple, DocstringMixin):
 
     def __init__(self, module, token_list, start_pos, end_pos, parent=None,
                  as_names=(), names_are_set_vars=False, set_name_parents=True):
-        super(Statement, self).__init__(module, start_pos, end_pos)
+        super(Statement, self).__init__(module, start_pos, end_pos, parent)
         self._token_list = token_list
         self._names_are_set_vars = names_are_set_vars
         if set_name_parents:
-            for t in token_list:
-                if isinstance(t, Name):
-                    t.parent = self.use_as_parent
             for n in as_names:
                 n.parent = self.use_as_parent
-        self.parent = parent
         self._doc_token = None
         self._set_vars = None
         self.as_names = list(as_names)
 
         # cache
         self._assignment_details = []
+        # For now just generate the expression list, even if its not needed.
+        # This will help to adapt a better new AST.
+        self.expression_list()
 
     @property
     def end_pos(self):
@@ -917,8 +950,8 @@ class Statement(Simple, DocstringMixin):
 
     def get_code(self, new_line=True):
         def assemble(command_list, assignment=None):
-            pieces = [c.get_code() if isinstance(c, Simple) else c.string if
-isinstance(c, tokenize.Token) else unicode(c)
+            pieces = [c.get_code() if isinstance(c, Simple) else c.string
+                      if isinstance(c, tokenize.Token) else unicode(c)
                       for c in command_list]
             if assignment is None:
                 return ''.join(pieces)
@@ -935,7 +968,7 @@ isinstance(c, tokenize.Token) else unicode(c)
             return code
 
     def get_defined_names(self):
-        """ Get the names for the statement. """
+        """Get the names for the statement."""
         if self._set_vars is None:
 
             def search_calls(calls):
@@ -944,17 +977,11 @@ isinstance(c, tokenize.Token) else unicode(c)
                         for stmt in call:
                             search_calls(stmt.expression_list())
                     elif isinstance(call, Call):
-                        c = call
                         # Check if there's an execution in it, if so this is
                         # not a set_var.
-                        is_execution = False
-                        while c:
-                            if Array.is_type(c.execution, Array.TUPLE):
-                                is_execution = True
-                            c = c.next
-                        if is_execution:
-                            continue
-                        self._set_vars.append(call.name)
+                        if not call.next:
+                            self._set_vars.append(call.name)
+                        continue
 
             self._set_vars = []
             for calls, operation in self.assignment_details:
@@ -964,6 +991,37 @@ isinstance(c, tokenize.Token) else unicode(c)
                 # In the case of Param, it's also a defining name without ``=``
                 search_calls(self.expression_list())
         return self._set_vars + self.as_names
+
+    def get_names_dict(self):
+        """The future of name resolution. Returns a dict(str -> Call)."""
+        dct = defaultdict(lambda: [])
+
+        def search_calls(calls):
+            for call in calls:
+                if isinstance(call, Array) and call.type != Array.DICT:
+                    for stmt in call:
+                        search_calls(stmt.expression_list())
+                elif isinstance(call, Call):
+                    c = call
+                    # Check if there's an execution in it, if so this is
+                    # not a set_var.
+                    while True:
+                        if c.next is None or isinstance(c.next, Array):
+                            break
+                        c = c.next
+                    dct[unicode(c.name)].append(call)
+
+        for calls, operation in self.assignment_details:
+            search_calls(calls)
+
+        if not self.assignment_details and self._names_are_set_vars:
+            # In the case of Param, it's also a defining name without ``=``
+            search_calls(self.expression_list())
+
+        for as_name in self.as_names:
+            dct[unicode(as_name)].append(Call(self._sub_module, as_name,
+                                         as_name.start_pos, as_name.end_pos, self))
+        return dct
 
     def is_global(self):
         p = self.parent
@@ -998,7 +1056,7 @@ isinstance(c, tokenize.Token) else unicode(c)
         """
         def is_assignment(tok):
             return isinstance(tok, Operator) and tok.string.endswith('=') \
-                and not tok.string in ('>=', '<=', '==', '!=')
+                and tok.string not in ('>=', '<=', '==', '!=')
 
         def parse_array(token_iterator, array_type, start_pos, add_el=None):
             arr = Array(self._sub_module, start_pos, array_type, self)
@@ -1037,7 +1095,7 @@ isinstance(c, tokenize.Token) else unicode(c)
             return arr, break_tok
 
         def parse_stmt(token_iterator, maybe_dict=False, added_breaks=(),
-                       break_on_assignment=False, stmt_class=Statement,
+                       break_on_assignment=False, stmt_class=ArrayStmt,
                        allow_comma=False):
             token_list = []
             level = 0
@@ -1051,7 +1109,7 @@ isinstance(c, tokenize.Token) else unicode(c)
                     first = False
 
                 if isinstance(tok, Base):
-                    # the token is a Name, which has already been parsed
+                    # The token is a Name, which has already been parsed.
                     if not level:
                         if isinstance(tok, ListComprehension):
                             # it's not possible to set it earlier
@@ -1104,12 +1162,12 @@ isinstance(c, tokenize.Token) else unicode(c)
                 return None, tok
 
             # Since Lambda is a Function scope, it needs Scope parents.
-            parent = self.get_parent_until(IsScope)
-            lambd = Lambda(self._sub_module, params, start_pos, parent)
+            lambd = Lambda(self._sub_module, params, start_pos, self)
 
             ret, tok = parse_stmt(token_iterator)
             if ret is not None:
                 ret.parent = lambd
+                lambd.statements.append(ret)
                 lambd.returns.append(ret)
             lambd.end_pos = self.end_pos
             return lambd, tok
@@ -1121,13 +1179,10 @@ isinstance(c, tokenize.Token) else unicode(c)
                                        added_breaks=added_breaks)
 
                 if stmt is not None:
-                    for t in stmt._token_list:
-                        if isinstance(t, Name):
-                            t.parent = stmt
                     stmt._names_are_set_vars = names_are_set_vars
                 return stmt, tok
 
-            st = Statement(self._sub_module, token_list, start_pos,
+            st = ArrayStmt(self._sub_module, token_list, start_pos,
                            end_pos, set_name_parents=False)
 
             middle, tok = parse_stmt_or_arr(token_iterator, ['in'], True)
@@ -1157,14 +1212,14 @@ isinstance(c, tokenize.Token) else unicode(c)
                     next(token_iterator, None)
                     continue
             else:
-                # the token is a Name, which has already been parsed
+                # The token is a Name, which has already been parsed
                 tok_str = tok
                 token_type = None
 
                 if is_assignment(tok):
                     # This means, there is an assignment here.
                     # Add assignments, which can be more than one
-                    self._assignment_details.append((result, tok.string))
+                    self._assignment_details.append((result, tok))
                     result = []
                     is_chain = False
                     continue
@@ -1173,11 +1228,11 @@ isinstance(c, tokenize.Token) else unicode(c)
                 lambd, tok_str = parse_lambda(token_iterator)
                 if lambd is not None:
                     result.append(lambd)
-                if tok_str not in (')', ','):
+                if tok_str != ',':
                     continue
 
             is_literal = token_type in (tokenize.STRING, tokenize.NUMBER)
-            if isinstance(tok_str, Name) or is_literal:
+            if is_literal or isinstance(tok, Name):
                 cls = Literal if is_literal else Call
 
                 call = cls(self._sub_module, tok_str, tok.start_pos, tok.end_pos, self)
@@ -1191,7 +1246,7 @@ isinstance(c, tokenize.Token) else unicode(c)
                     token_iterator, brackets[tok.string], tok.start_pos
                 )
                 if result and isinstance(result[-1], StatementElement):
-                    result[-1].set_execution(arr)
+                    result[-1].set_next(arr)
                 else:
                     arr.parent = self
                     result.append(arr)
@@ -1200,7 +1255,7 @@ isinstance(c, tokenize.Token) else unicode(c)
                     is_chain = True
             elif tok_str == ',' and result:  # implies a tuple
                 # expression is now an array not a statement anymore
-                stmt = Statement(self._sub_module, result, result[0].start_pos,
+                stmt = ArrayStmt(self._sub_module, result, result[0].start_pos,
                                  tok.end_pos, self.parent, set_name_parents=False)
                 stmt._expression_list = result
                 arr, break_tok = parse_array(token_iterator, Array.TUPLE,
@@ -1222,7 +1277,27 @@ isinstance(c, tokenize.Token) else unicode(c)
         self._expression_list = lst
 
 
-class Param(Statement):
+class ExprStmt(Statement):
+    """
+    This class exists temporarily, to be able to distinguish real statements
+    (``small_stmt`` in Python grammar) from the so called ``test`` parts, that
+    may be used to defined part of an array, but are never a whole statement.
+
+    The reason for this class is purely historical. It was easier to just use
+    Statement nested, than to create a new class for Test (plus Jedi's fault
+    tolerant parser just makes things very complicated).
+    """
+
+
+class ArrayStmt(Statement):
+    """
+    This class exists temporarily. Like ``ExprStatement``, this exists to
+    distinguish between real statements and stuff that is defined in those
+    statements.
+    """
+
+
+class Param(ExprStmt):
     """
     The class which shows definitions of params of classes and functions.
     But this is not to define function calls.
@@ -1261,59 +1336,40 @@ class Param(Statement):
 
 
 class StatementElement(Simple):
-    __slots__ = ('parent', 'next', 'execution')
+    __slots__ = ('next', 'previous')
 
     def __init__(self, module, start_pos, end_pos, parent):
-        super(StatementElement, self).__init__(module, start_pos, end_pos)
-
-        # parent is not the oposite of next. The parent of c: a = [b.c] would
-        # be an array.
-        self.parent = parent
+        super(StatementElement, self).__init__(module, start_pos, end_pos, parent)
         self.next = None
-        self.execution = None
+        self.previous = None
 
     def set_next(self, call):
         """ Adds another part of the statement"""
-        call.parent = self
+        call.parent = self.parent
         if self.next is not None:
             self.next.set_next(call)
         else:
             self.next = call
+            call.previous = self
 
-    def set_execution(self, call):
-        """
-        An execution is nothing else than brackets, with params in them, which
-        shows access on the internals of this name.
-        """
-        call.parent = self
-        if self.next is not None:
-            self.next.set_execution(call)
-        elif self.execution is not None:
-            self.execution.set_execution(call)
-        else:
-            self.execution = call
+    def next_is_execution(self):
+        return Array.is_type(self.next, Array.TUPLE, Array.NOARRAY)
 
     def generate_call_path(self):
         """ Helps to get the order in which statements are executed. """
         try:
-            for name_part in self.name.names:
-                yield name_part
+            yield self.name
         except AttributeError:
             yield self
-        if self.execution is not None:
-            for y in self.execution.generate_call_path():
-                yield y
         if self.next is not None:
             for y in self.next.generate_call_path():
                 yield y
 
     def get_code(self):
-        s = ''
-        if self.execution is not None:
-            s += self.execution.get_code()
         if self.next is not None:
-            s += '.' + self.next.get_code()
-        return s
+            s = '.' if not isinstance(self.next, Array) else ''
+            return s + self.next.get_code()
+        return ''
 
 
 class Call(StatementElement):
@@ -1321,10 +1377,26 @@ class Call(StatementElement):
 
     def __init__(self, module, name, start_pos, end_pos, parent=None):
         super(Call, self).__init__(module, start_pos, end_pos, parent)
+        name.parent = self
         self.name = name
 
     def get_code(self):
         return self.name.get_code() + super(Call, self).get_code()
+
+    def names(self):
+        """
+        Generate an array of string names. If a call is not just names,
+        raise an error.
+        """
+        def check(call):
+            while call is not None:
+                if not isinstance(call, Call):  # Could be an Array.
+                    break
+                yield unicode(call.name)
+                call = call.next
+
+        return list(check(self))
+
 
     def __repr__(self):
         return "<%s: %s>" % (type(self).__name__, self.name)
@@ -1442,7 +1514,7 @@ class Array(StatementElement):
         return "<%s: %s%s>" % (type(self).__name__, typ, self.values)
 
 
-class NamePart(object):
+class Name(object):
     """
     A string. Sometimes it is important to know if the string belongs to a name
     or not.
@@ -1450,11 +1522,12 @@ class NamePart(object):
     # Unfortunately there's no way to use slots for str (non-zero __itemsize__)
     # -> http://utcc.utoronto.ca/~cks/space/blog/python/IntSlotsPython3k
     # Therefore don't subclass `str`.
-    __slots__ = ('parent', '_string', '_line', '_column')
+    __slots__ = ('_sub_module', 'parent', '_string', '_line', '_column')
 
-    def __init__(self, string, parent, start_pos):
+    def __init__(self, sub_module, string, parent, start_pos):
         self._string = string
         self.parent = parent
+        self._sub_module = sub_module
         self._line = start_pos[0]
         self._column = start_pos[1]
 
@@ -1465,10 +1538,14 @@ class NamePart(object):
         return self._string
 
     def __repr__(self):
-        return "<%s: %s>" % (type(self).__name__, self._string)
+        return "<%s: %s@%s,%s>" % (type(self).__name__, self._string,
+                                   self.start_pos[0], self.start_pos[1])
 
     def get_code(self):
         return self._string
+
+    def get_definition(self):
+        return self.get_parent_until((ArrayStmt, StatementElement), reverse=True)
 
     def get_parent_until(self, *args, **kwargs):
         return self.parent.get_parent_until(*args, **kwargs)
@@ -1478,52 +1555,12 @@ class NamePart(object):
 
     @property
     def start_pos(self):
-        offset = self.parent._sub_module.line_offset
+        offset = self._sub_module.line_offset
         return offset + self._line, self._column
 
     @property
     def end_pos(self):
         return self.start_pos[0], self.start_pos[1] + len(self._string)
-
-
-class Name(Simple):
-    """
-    Used to define names in python.
-    Which means the whole namespace/class/function stuff.
-    So a name like "module.class.function"
-    would result in an array of [module, class, function]
-    """
-    __slots__ = ('names', '_get_code')
-
-    def __init__(self, module, names, start_pos, end_pos, parent=None):
-        super(Name, self).__init__(module, start_pos, end_pos)
-        # Cache get_code, because it's used quite often for comparisons
-        # (seen by using the profiler).
-        self._get_code = ".".join(n[0] for n in names)
-
-        names = tuple(NamePart(n[0], self, n[1]) for n in names)
-        self.names = names
-        if parent is not None:
-            self.parent = parent
-
-    def get_code(self):
-        """ Returns the names in a full string format """
-        return self._get_code
-
-    @property
-    def end_pos(self):
-        return self.names[-1].end_pos
-
-    @property
-    def docstr(self):
-        """Return attribute docstring (PEP 257) if exists."""
-        return self.parent.docstr
-
-    def __str__(self):
-        return self.get_code()
-
-    def __len__(self):
-        return len(self.names)
 
 
 class ListComprehension(ForFlow):
@@ -1570,9 +1607,8 @@ class Operator(Simple):
 
     def __init__(self, module, string, parent, start_pos):
         end_pos = start_pos[0], start_pos[1] + len(string)
-        super(Operator, self).__init__(module, start_pos, end_pos)
+        super(Operator, self).__init__(module, start_pos, end_pos, parent)
         self.string = string
-        self.parent = parent
 
     def get_code(self):
         return self.string
@@ -1580,9 +1616,18 @@ class Operator(Simple):
     def __repr__(self):
         return "<%s: `%s`>" % (type(self).__name__, self.string)
 
+    def __str__(self):
+        return self.get_code()
+
     def __eq__(self, other):
-        """Make comparisons easy. Improves the readability of the parser."""
-        return self.string == other
+        """
+        Make comparisons with strings easy.
+        Improves the readability of the parser.
+        """
+        if isinstance(other, Operator):
+            return self is other
+        else:
+            return self.string == other
 
     def __ne__(self, other):
         """Python 2 compatibility."""

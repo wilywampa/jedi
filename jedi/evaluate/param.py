@@ -1,12 +1,12 @@
 import copy
 
 from jedi._compatibility import unicode, zip_longest
+from jedi import debug
+from jedi import common
 from jedi.parser import representation as pr
 from jedi.evaluate import iterable
-from jedi import common
 from jedi.evaluate import helpers
 from jedi.evaluate import analysis
-from jedi.evaluate.compiled import CompiledObject
 
 
 class ExecutedParam(pr.Param):
@@ -44,10 +44,10 @@ def _get_calling_var_args(evaluator, var_args):
             if len(exp_list) != 2 or exp_list[0] not in ('*', '**'):
                 continue
 
-            names, _ = evaluator.goto(argument, [exp_list[1].get_code()])
+            names = evaluator.goto(argument, [exp_list[1].get_code()])
             if len(names) != 1:
                 break
-            param = names[0].parent
+            param = names[0].get_definition()
             if not isinstance(param, ExecutedParam):
                 if isinstance(param, pr.Param):
                     # There is no calling var_args in this case - there's just
@@ -294,12 +294,12 @@ def _iterate_star_args(evaluator, array, expression_list, func):
     elif isinstance(array, iterable.Generator):
         for field_stmt in array.iter_content():
             yield helpers.FakeStatement([field_stmt])
-    elif isinstance(array, Instance) and array.name == 'tuple':
-        pass
+    elif isinstance(array, Instance) and array.name.get_code() == 'tuple':
+        debug.warning('Ignored a tuple *args input %s' % array)
     else:
         if expression_list:
             m = "TypeError: %s() argument after * must be a sequence, not %s" \
-                % (func.name, array)
+                % (func.name.get_code(), array)
             analysis.add(evaluator, 'type-error-star',
                          expression_list[0], message=m)
 
@@ -307,7 +307,7 @@ def _iterate_star_args(evaluator, array, expression_list, func):
 def _star_star_dict(evaluator, array, expression_list, func):
     dct = {}
     from jedi.evaluate.representation import Instance
-    if isinstance(array, Instance) and array.name == 'dict':
+    if isinstance(array, Instance) and array.name.get_code() == 'dict':
         # For now ignore this case. In the future add proper iterators and just
         # make one call without crazy isinstance checks.
         return {}
@@ -321,6 +321,7 @@ def _star_star_dict(evaluator, array, expression_list, func):
             elif isinstance(call, pr.Call):
                 key = call.name
             else:
+                debug.warning('Ignored complicated **kwargs stmt %s' % call)
                 continue  # We ignore complicated statements here, for now.
 
             # If the string is a duplicate, we don't care it's illegal Python
@@ -329,7 +330,7 @@ def _star_star_dict(evaluator, array, expression_list, func):
     else:
         if expression_list:
             m = "TypeError: %s argument after ** must be a mapping, not %s" \
-                % (func.name, array)
+                % (func.name.get_code(), array)
             analysis.add(evaluator, 'type-error-star-star',
                          expression_list[0], message=m)
     return dct

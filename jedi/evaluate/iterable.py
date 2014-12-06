@@ -35,7 +35,12 @@ from jedi.cache import underscore_memoization
 from jedi.evaluate import analysis
 
 
-class Generator(use_metaclass(CachedMetaClass, pr.Base)):
+class IterableWrapper(pr.Base):
+    def is_class(self):
+        return False
+
+
+class Generator(use_metaclass(CachedMetaClass, IterableWrapper)):
     """Handling of `yield` functions."""
     def __init__(self, evaluator, func, var_args):
         super(Generator, self).__init__()
@@ -62,7 +67,10 @@ class Generator(use_metaclass(CachedMetaClass, pr.Base)):
 
     def iter_content(self):
         """ returns the content of __iter__ """
-        return self._evaluator.execute(self.func, self.var_args, True)
+        # Directly execute it, because with a normal call to py__call__ a
+        # Generator will be returned.
+        from jedi.evaluate.representation import FunctionExecution
+        return FunctionExecution(self._evaluator, self.func, self.var_args).get_return_types()
 
     def get_index_types(self, index_array):
         #debug.warning('Tried to get array access on a generator: %s', self)
@@ -88,13 +96,14 @@ class Generator(use_metaclass(CachedMetaClass, pr.Base)):
         return "<%s of %s>" % (type(self).__name__, self.func)
 
 
-class GeneratorMethod(object):
+class GeneratorMethod(IterableWrapper):
     """``__next__`` and ``send`` methods."""
     def __init__(self, generator, builtin_func):
         self._builtin_func = builtin_func
         self._generator = generator
 
-    def execute(self):
+    def py__call__(self, evaluator, params):
+        # TODO add TypeError if params are given.
         return self._generator.iter_content()
 
     def __getattr__(self, name):
@@ -110,7 +119,7 @@ class GeneratorComprehension(Generator):
         return self._evaluator.eval_statement_element(self.comprehension)
 
 
-class Array(use_metaclass(CachedMetaClass, pr.Base)):
+class Array(use_metaclass(CachedMetaClass, IterableWrapper)):
     """
     Used as a mirror to pr.Array, if needed. It defines some getter
     methods which are important in this module.
@@ -118,6 +127,13 @@ class Array(use_metaclass(CachedMetaClass, pr.Base)):
     def __init__(self, evaluator, array):
         self._evaluator = evaluator
         self._array = array
+
+    @property
+    def name(self):
+        return helpers.FakeName(self._array.type, parent=self)
+
+    def py__bool__(self):
+        return None  # We don't know the length, because of appends.
 
     @memoize_default(NO_DEFAULT)
     def get_index_types(self, index_array=()):
@@ -177,14 +193,14 @@ class Array(use_metaclass(CachedMetaClass, pr.Base)):
 
     def scope_names_generator(self, position=None):
         """
-        This method generates all `ArrayMethod` for one pr.Array.
         It returns e.g. for a list: append, pop, ...
         """
         # `array.type` is a string with the type, e.g. 'list'.
         scope = self._evaluator.find_types(compiled.builtin, self._array.type)[0]
         scope = self._evaluator.execute(scope)[0]  # builtins only have one class
+        from jedi.evaluate.representation import get_instance_el
         for _, names in scope.scope_names_generator():
-            yield self, [ArrayMethod(n) for n in names]
+            yield self, [get_instance_el(self._evaluator, self, n) for n in names]
 
     @common.safe_property
     def parent(self):
@@ -207,28 +223,6 @@ class Array(use_metaclass(CachedMetaClass, pr.Base)):
 
     def __repr__(self):
         return "<e%s of %s>" % (type(self).__name__, self._array)
-
-
-class ArrayMethod(object):
-    """
-    A name, e.g. `list.append`, it is used to access the original array
-    methods.
-    """
-    def __init__(self, name):
-        super(ArrayMethod, self).__init__()
-        self.name = name
-
-    def __getattr__(self, name):
-        # Set access privileges:
-        if name not in ['parent', 'names', 'start_pos', 'end_pos', 'get_code']:
-            raise AttributeError('Strange accesson %s: %s.' % (self, name))
-        return getattr(self.name, name)
-
-    def get_parent_until(self):
-        return compiled.builtin
-
-    def __repr__(self):
-        return "<%s of %s>" % (type(self).__name__, self.name)
 
 
 class MergedArray(Array):
@@ -284,6 +278,7 @@ def get_iterator_types(inputs):
             except KeyError:
                 debug.warning('Instance has no __next__ function in %s.', it)
         else:
+            # TODO this is not correct, __iter__ can return arbitrary input!
             # Is a generator.
             result += it.iter_content()
     return result
@@ -319,7 +314,7 @@ def _check_array_additions(evaluator, compare_array, module, is_list):
         result = []
         for c in calls:
             call_path = list(c.generate_call_path())
-            call_path_simple = [unicode(n) if isinstance(n, pr.NamePart) else n
+            call_path_simple = [unicode(n) if isinstance(n, pr.Name) else n
                                 for n in call_path]
             separate_index = call_path_simple.index(add_name)
             if add_name == call_path_simple[-1] or separate_index == 0:
@@ -329,7 +324,7 @@ def _check_array_additions(evaluator, compare_array, module, is_list):
             backtrack_path = iter(call_path[:separate_index])
 
             position = c.start_pos
-            scope = c.get_parent_until(pr.IsScope)
+            scope = c.get_parent_scope()
 
             found = evaluator.eval_call_path(backtrack_path, scope, position)
             if not compare_array in found:
@@ -394,7 +389,7 @@ def _check_array_additions(evaluator, compare_array, module, is_list):
             # InstanceElements are special, because they don't get copied,
             # but have this wrapper around them.
             if isinstance(comp_arr_parent, er.InstanceElement):
-                stmt = er.InstanceElement(comp_arr_parent.instance, stmt)
+                stmt = er.get_instance_el(comp_arr_parent.instance, stmt)
 
             if evaluator.recursion_detector.push_stmt(stmt):
                 # check recursion
@@ -415,7 +410,7 @@ def check_array_instances(evaluator, instance):
     return [ai]
 
 
-class ArrayInstance(pr.Base):
+class ArrayInstance(IterableWrapper):
     """
     Used for the usage of set() and list().
     This is definitely a hack, but a good one :-)
@@ -477,7 +472,7 @@ class Slice(object):
             if element is None:
                 return None
 
-            result = self._evaluator.process_precedence_element(element)
+            result = precedence.process_precedence_element(self._evaluator, element)
             if len(result) != 1:
                 # We want slices to be clear defined with just one type.
                 # Otherwise we will return an empty slice object.
@@ -515,4 +510,4 @@ def create_indexes_or_slices(evaluator, index_array):
             step = None
         return (Slice(evaluator, start, stop, step),)
     else:
-        return tuple(evaluator.process_precedence_element(prec))
+        return tuple(precedence.process_precedence_element(evaluator, prec))

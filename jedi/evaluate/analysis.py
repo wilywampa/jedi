@@ -63,7 +63,7 @@ class Error(object):
         return hash((self.path, self._start_pos, self.name))
 
     def __repr__(self):
-        return '<%s %s: %s@%s,%s' % (self.__class__.__name__,
+        return '<%s %s: %s@%s,%s>' % (self.__class__.__name__,
                                      self.name, self.path,
                                      self._start_pos[0], self._start_pos[1])
 
@@ -161,7 +161,8 @@ def _check_for_exception_catch(evaluator, jedi_obj, exception, payload=None):
             assert len(expression_list) == 1
             call = expression_list[0]
             assert isinstance(call, pr.Call) and str(call.name) == 'hasattr'
-            execution = call.execution
+            assert call.next_is_execution()
+            execution = call.next
             assert execution and len(execution) == 2
 
             # check if the names match

@@ -96,8 +96,7 @@ from import_tree.rename1 import abc
 #< (0, 32),
 from import_tree.rename1 import not_existing
 
-# shouldn't work
-#< 
+# Shouldn't work (would raise a NotFoundError, because there's no name.)
 from not_existing import *
 
 # -----------------
@@ -186,7 +185,7 @@ class TestClass(Super):
         TestClass.base_var
 
 
-        #< 13 (5,13), (0,13)
+        #< 13 (5,13), (0,13), (-24,13)
         self.instance_var = 3
 
     #< 9 (0,8), 

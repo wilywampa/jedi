@@ -92,7 +92,7 @@ class TestRegression(TestCase):
         class C:
             pass
 
-        variable = f or C""")
+        variable = f if random.choice([0, 1]) else C""")
         defs = Script(source, column=3).goto_definitions()
         defs = sorted(defs, key=lambda d: d.line)
         self.assertEqual([d.description for d in defs],
@@ -104,7 +104,7 @@ class TestRegression(TestCase):
         parser = Parser(s)
         for i, s in enumerate(parser.module.statements, 3):
             for c in s.expression_list():
-                self.assertEqual(c.execution.end_pos[1], i)
+                self.assertEqual(c.next.end_pos[1], i)
 
     def check_definition_by_marker(self, source, after_cursor, names):
         r"""

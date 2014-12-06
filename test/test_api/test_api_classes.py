@@ -6,8 +6,7 @@ from inspect import cleandoc
 
 import pytest
 
-from jedi import Script, defined_names, __doc__ as jedi_doc
-from jedi.parser import representation as pr
+from jedi import Script, defined_names, __doc__ as jedi_doc, names
 from ..helpers import cwd_at
 from ..helpers import TestCase
 
@@ -149,6 +148,39 @@ def test_signature_params():
     check(Script(s + '\nbar=foo\nbar').goto_assignments())
 
 
+class TestIsDefinition(TestCase):
+    def _def(self, source, index=-1):
+        return names(dedent(source), references=True, all_scopes=True)[index]
+
+    def _bool_is_definitions(self, source):
+        ns = names(dedent(source), references=True, all_scopes=True)
+        # Assure that names are definitely sorted.
+        ns = sorted(ns, key=lambda name: (name.line, name.column))
+        return [name.is_definition() for name in ns]
+
+    def test_name(self):
+        d = self._def('name')
+        assert d.name == 'name'
+        assert not d.is_definition()
+
+    def test_stmt(self):
+        src = 'a = f(x)'
+        d = self._def(src, 0)
+        assert d.name == 'a'
+        assert d.is_definition()
+        d = self._def(src, 1)
+        assert d.name == 'f'
+        assert not d.is_definition()
+        d = self._def(src)
+        assert d.name == 'x'
+        assert not d.is_definition()
+
+    def test_import(self):
+        assert self._bool_is_definitions('import x as a') == [False, True]
+        assert self._bool_is_definitions('from x import y') == [False, True]
+        assert self._bool_is_definitions('from x.z import y') == [False, False, True]
+
+
 class TestParent(TestCase):
     def _parent(self, source, line=None, column=None):
         defs = Script(dedent(source), line, column).goto_assignments()
@@ -171,8 +203,8 @@ class TestParent(TestCase):
         parent = self._parent('''\
             def spam():
                 pass''', 1, len('def spam'))
-        assert parent.name == 'spam'
-        assert parent.parent().type == 'module'
+        assert parent.name == ''
+        assert parent.type == 'module'
 
     def test_parent_on_completion(self):
         parent = Script(dedent('''\
@@ -193,3 +225,87 @@ def test_type():
     """
     for c in Script('import os; os.path.').completions():
         assert c.type
+
+
+class TestGotoAssignments(TestCase):
+    """
+    This tests the BaseDefinition.goto_assignments function, not the jedi
+    function. They are not really different in functionality, but really
+    different as an implementation.
+    """
+    def test_repetition(self):
+        defs = names('a = 1; a', references=True, definitions=False)
+        # Repeat on the same variable. Shouldn't change once we're on a
+        # definition.
+        for _ in range(3):
+            assert len(defs) == 1
+            ass = defs[0].goto_assignments()
+            assert ass[0].description == 'a = 1'
+
+    def test_named_params(self):
+        src = """\
+                def foo(a=1, bar=2):
+                    pass
+                foo(bar=1)
+              """
+        bar = names(dedent(src), references=True)[-1]
+        param = bar.goto_assignments()[0]
+        assert param.start_pos == (1, 13)
+        assert param.type == 'param'
+
+    def test_class_call(self):
+        src = 'from threading import Thread; Thread(group=1)'
+        n = names(src, references=True)[-1]
+        assert n.name == 'group'
+        param_def = n.goto_assignments()[0]
+        assert param_def.name == 'group'
+        assert param_def.type == 'param'
+
+    def test_parentheses(self):
+        n = names('("").upper', references=True)[-1]
+        assert n.goto_assignments()[0].name == 'upper'
+
+    def test_import(self):
+        nms = names('from json import load', references=True)
+        assert nms[0].name == 'json'
+        assert nms[0].type == 'import'
+        n = nms[0].goto_assignments()[0]
+        assert n.name == 'json'
+        assert n.type == 'module'
+
+        assert nms[1].name == 'load'
+        assert nms[1].type == 'import'
+        n = nms[1].goto_assignments()[0]
+        assert n.name == 'load'
+        assert n.type == 'function'
+
+        nms = names('import os; os.path', references=True)
+        assert nms[0].name == 'os'
+        assert nms[0].type == 'import'
+        n = nms[0].goto_assignments()[0]
+        assert n.name == 'os'
+        assert n.type == 'module'
+
+        n = nms[2].goto_assignments()[0]
+        assert n.name == 'path'
+        assert n.type == 'import'
+
+        nms = names('import os.path', references=True)
+        n = nms[0].goto_assignments()[0]
+        assert n.name == 'os'
+        assert n.type == 'module'
+        n = nms[1].goto_assignments()[0]
+        assert n.name == 'path'
+        assert n.type == 'import'
+
+    def test_import_alias(self):
+        nms = names('import json as foo', references=True)
+        assert nms[0].name == 'json'
+        assert nms[0].type == 'import'
+        n = nms[0].goto_assignments()[0]
+        assert n.name == 'json'
+        assert n.type == 'module'
+
+        assert nms[1].name == 'foo'
+        assert nms[1].type == 'import'
+        assert [nms[1]] == nms[1].goto_assignments()

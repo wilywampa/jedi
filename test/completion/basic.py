@@ -23,18 +23,18 @@ a(0):.
 # if/else/elif
 # -----------------
 
-if 1:
+if (random.choice([0, 1])):
     1
-elif(3):
+elif(random.choice([0, 1])):
     a = 3
 else:
     a = ''
 #? int() str()
 a
 def func():
-    if 1:
+    if random.choice([0, 1]):
         1
-    elif(3):
+    elif(random.choice([0, 1])):
         a = 3
     else:
         a = ''
@@ -51,7 +51,7 @@ func()
 assert []
 
 def focus_return():
-    #? list
+    #? list()
     return []
 
 
@@ -163,7 +163,7 @@ def listen(arg):
         x
 
 listen(['' for x in [1]])
-#? str()
+#? str
 ([str for x in []])[0]
 
 
@@ -204,7 +204,7 @@ gen = (i for i in (1,))
 
 #? int()
 next(gen)
-#? 
+#?
 gen[0]
 
 gen = (a for arr in [[1.0]] for a in arr)
@@ -275,7 +275,7 @@ def a():
     """
     pass
 
-#? 
+#?
 # str literals in comment """ upper
 
 # -----------------
@@ -354,16 +354,6 @@ except MyException as e:
 foo = \
 1
 #? int()
-foo
-
-# -----------------
-# if `is not` checks
-# -----------------
-
-foo = ['a']
-if foo is not None:
-    foo = ''.join(foo)
-#? str()
 foo
 
 # -----------------

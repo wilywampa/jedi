@@ -26,6 +26,9 @@ Jorgen Schaefer (@jorgenschaefer) <contact@jorgenschaefer.de>
 Fredrik Bergroth (@fbergroth)
 Mathias Fußenegger (@mfussenegger)
 Syohei Yoshida (@syohex) <syohex@gmail.com>
+ppalucky (@ppalucky)
+immerrr (@immerrr) immerrr@gmail.com
+Albertas Agejevas (@alga)
 Phillip Berndt (@phillipberndt) <phillip.berndt@gmail.com>
 
 Note: (@user) means a github user name.

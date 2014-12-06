@@ -32,7 +32,7 @@ from jedi.evaluate import Evaluator, filter_private_variable
 from jedi.evaluate import representation as er
 from jedi.evaluate import compiled
 from jedi.evaluate import imports
-from jedi.evaluate.helpers import FakeName
+from jedi.evaluate.helpers import FakeName, get_module_name_parts
 from jedi.evaluate.finder import get_names_of_scope
 from jedi.evaluate.helpers import search_call_signatures
 from jedi.evaluate import analysis
@@ -98,7 +98,7 @@ class Script(object):
             raise ValueError('`column` parameter is not in a valid range.')
         self._pos = line, column
 
-        cache.clear_caches()
+        cache.clear_time_caches()
         debug.reset_time()
         self._user_context = UserContext(self.source, self._pos)
         self._parser = UserContextParser(self.source, path, self._pos, self._user_context)
@@ -159,8 +159,8 @@ class Script(object):
         if not dot:
             # add named params
             for call_sig in self.call_signatures():
-                # allow protected access, because it's a public API.
-                module = call_sig._definition.get_parent_until()
+                # Allow protected access, because it's a public API.
+                module = call_sig._name.get_parent_until()
                 # Compiled modules typically don't allow keyword arguments.
                 if not isinstance(module, compiled.CompiledObject):
                     for p in call_sig.params:
@@ -168,7 +168,7 @@ class Script(object):
                         # public API and we don't want to make the internal
                         # Name object public.
                         if p._definition.stars == 0:  # no *args/**kwargs
-                            completions.append((p._definition.get_name(), p))
+                            completions.append((p._name, p._name))
 
             if not path and not isinstance(user_stmt, pr.Import):
                 # add keywords
@@ -179,11 +179,15 @@ class Script(object):
         comps = []
         comp_dct = {}
         for c, s in set(completions):
-            n = str(c.names[-1])
+            n = str(c)
             if settings.case_insensitive_completion \
                     and n.lower().startswith(like.lower()) \
                     or n.startswith(like):
                 if not filter_private_variable(s, user_stmt or self._parser.user_scope(), n):
+                    if isinstance(c.parent, (pr.Function, pr.Class)):
+                        # TODO I think this is a hack. It should be an
+                        #   er.Function/er.Class before that.
+                        c = er.wrap(self._evaluator, c.parent).name
                     new = classes.Completion(self._evaluator, c, needs_dot, len(like), s)
                     k = (new.name, new.complete)  # key
                     if k in comp_dct and settings.no_completion_duplicates:
@@ -263,6 +267,7 @@ class Script(object):
                 if user_stmt is not None:
                     eval_stmt.start_pos = user_stmt.end_pos
             scopes = self._evaluator.eval_statement(eval_stmt)
+
         return scopes
 
     def _get_under_cursor_stmt(self, cursor_txt):
@@ -275,7 +280,7 @@ class Script(object):
             raise NotFoundError()
         if isinstance(stmt, pr.KeywordStatement):
             stmt = stmt.stmt
-        if not isinstance(stmt, pr.Statement):
+        if not isinstance(stmt, pr.ExprStmt):
             raise NotFoundError()
 
         user_stmt = self._parser.user_stmt()
@@ -375,29 +380,23 @@ class Script(object):
         context = self._user_context.get_context()
         definitions = set()
         if next(context) in ('class', 'def'):
-            definitions = set([self._parser.user_scope()])
+            definitions = set([er.wrap(self._evaluator, self._parser.user_scope())])
         else:
             # Fetch definition of callee, if there's no path otherwise.
             if not goto_path:
-                (call, _) = search_call_signatures(user_stmt, self._pos)
+                call, _, _ = search_call_signatures(user_stmt, self._pos)
                 if call is not None:
-                    while call.next is not None:
-                        call = call.next
-                    # reset cursor position:
-                    (row, col) = call.name.end_pos
-                    pos = (row, max(col - 1, 0))
-                    self._user_context = UserContext(self.source, pos)
-                    # then try to find the path again
-                    goto_path = self._user_context.get_path_under_cursor()
+                    definitions = set(self._evaluator.eval_call(call))
 
         if not definitions:
             if goto_path:
                 definitions = set(self._prepare_goto(goto_path))
 
         definitions = resolve_import_paths(definitions)
-        d = set([classes.Definition(self._evaluator, s) for s in definitions
-                 if s is not imports.ImportWrapper.GlobalNamespace])
-        return helpers.sorted_definitions(d)
+        names = [s.name for s in definitions
+                 if s is not imports.ImportWrapper.GlobalNamespace]
+        defs = [classes.Definition(self._evaluator, name) for name in names]
+        return helpers.sorted_definitions(set(defs))
 
     def goto_assignments(self):
         """
@@ -408,7 +407,7 @@ class Script(object):
 
         :rtype: list of :class:`classes.Definition`
         """
-        results, _ = self._goto()
+        results = self._goto()
         d = [classes.Definition(self._evaluator, d) for d in set(results)
              if d is not imports.ImportWrapper.GlobalNamespace]
         return helpers.sorted_definitions(d)
@@ -436,10 +435,24 @@ class Script(object):
         goto_path = self._user_context.get_path_under_cursor()
         context = self._user_context.get_context()
         user_stmt = self._parser.user_stmt()
+
+        stmt = self._get_under_cursor_stmt(goto_path)
+        expression_list = stmt.expression_list()
+        if len(expression_list) == 0:
+            return []
+        # The reverse tokenizer only generates parses call.
+        assert len(expression_list) == 1
+        call = expression_list[0]
+        if isinstance(call, pr.Call):
+            call_path = list(call.generate_call_path())
+        else:
+            # goto_assignments on Operator returns nothing.
+            return []
+
         if next(context) in ('class', 'def'):
+            # The cursor is on a class/function name.
             user_scope = self._parser.user_scope()
             definitions = set([user_scope.name])
-            search_name = unicode(user_scope.name)
         elif isinstance(user_stmt, pr.Import):
             s, name_part = helpers.get_on_import_stmt(self._evaluator,
                                                       self._user_context, user_stmt)
@@ -447,56 +460,27 @@ class Script(object):
                 definitions = [s.follow(is_goto=True)[0]]
             except IndexError:
                 definitions = []
-            search_name = unicode(name_part)
 
             if add_import_name:
                 import_name = user_stmt.get_defined_names()
                 # imports have only one name
-                if not user_stmt.star \
-                        and unicode(name_part) == unicode(import_name[0].names[-1]):
-                    definitions.append(import_name[0])
+                np = import_name[0]
+                if not user_stmt.star and unicode(name_part) == unicode(np):
+                    definitions.append(np)
         else:
-            stmt = self._get_under_cursor_stmt(goto_path)
+            # The Evaluator.goto function checks for definitions, but since we
+            # use a reverse tokenizer, we have new name_part objects, so we
+            # have to check the user_stmt here for positions.
+            if isinstance(user_stmt, pr.ExprStmt):
+                for name in user_stmt.get_defined_names():
+                    if name.start_pos <= self._pos <= name.end_pos \
+                            and (not isinstance(name.parent, pr.Call)
+                                 or name.parent.next is None):
+                        return [name]
 
-            def test_lhs():
-                """
-                Special rule for goto, left hand side of the statement returns
-                itself, if the name is ``foo``, but not ``foo.bar``.
-                """
-                if isinstance(user_stmt, pr.Statement):
-                    for name in user_stmt.get_defined_names():
-                        if name.start_pos <= self._pos <= name.end_pos \
-                                and len(name.names) == 1:
-                            return name, unicode(name.names[-1])
-                return None, None
-
-            lhs, search_name = test_lhs()
-            if lhs is None:
-                expression_list = stmt.expression_list()
-                if len(expression_list) == 0:
-                    return [], ''
-                # Only the first command is important, the rest should basically not
-                # happen except in broken code (e.g. docstrings that aren't code).
-                call = expression_list[0]
-                if isinstance(call, pr.Call):
-                    call_path = list(call.generate_call_path())
-                else:
-                    call_path = [call]
-
-                defs, search_name_part = self._evaluator.goto(stmt, call_path)
-                search_name = unicode(search_name_part)
-                definitions = follow_inexistent_imports(defs)
-            else:
-                definitions = [lhs]
-            if isinstance(user_stmt, pr.Statement):
-                c = user_stmt.expression_list()
-                if c and not isinstance(c[0], (str, unicode)) \
-                        and c[0].start_pos > self._pos \
-                        and not re.search(r'\.\w+$', goto_path):
-                    # The cursor must be after the start, otherwise the
-                    # statement is just an assignee.
-                    definitions = [user_stmt]
-        return definitions, search_name
+            defs = self._evaluator.goto(stmt, call_path)
+            definitions = follow_inexistent_imports(defs)
+        return definitions
 
     def usages(self, additional_module_paths=()):
         """
@@ -511,31 +495,32 @@ class Script(object):
         """
         temp, settings.dynamic_flow_information = \
             settings.dynamic_flow_information, False
-        user_stmt = self._parser.user_stmt()
-        definitions, search_name = self._goto(add_import_name=True)
-        if isinstance(user_stmt, pr.Statement):
-            c = user_stmt.expression_list()[0]
-            if not isinstance(c, unicode) and self._pos < c.start_pos:
-                # the search_name might be before `=`
-                definitions = [v for v in user_stmt.get_defined_names()
-                               if unicode(v.names[-1]) == search_name]
-        if not isinstance(user_stmt, pr.Import):
-            # import case is looked at with add_import_name option
-            definitions = usages.usages_add_import_modules(self._evaluator, definitions, search_name)
+        try:
+            user_stmt = self._parser.user_stmt()
+            definitions = self._goto(add_import_name=True)
+            if not definitions:
+                # Without a definition for a name we cannot find references.
+                return []
 
-        module = set([d.get_parent_until() for d in definitions])
-        module.add(self._parser.module())
-        names = usages.usages(self._evaluator, definitions, search_name, module)
+            if not isinstance(user_stmt, pr.Import):
+                # import case is looked at with add_import_name option
+                definitions = usages.usages_add_import_modules(self._evaluator,
+                                                               definitions)
 
-        for d in set(definitions):
-            try:
-                name_part = d.names[-1]
-            except AttributeError:
-                names.append(classes.Definition(self._evaluator, d))
-            else:
-                names.append(classes.Definition(self._evaluator, name_part))
+            module = set([d.get_parent_until() for d in definitions])
+            module.add(self._parser.module())
+            names = usages.usages(self._evaluator, definitions, module)
 
-        settings.dynamic_flow_information = temp
+            for d in set(definitions):
+                try:
+                    name_part = d.names[-1]
+                except AttributeError:
+                    names.append(classes.Definition(self._evaluator, d))
+                else:
+                    names.append(classes.Definition(self._evaluator, name_part))
+        finally:
+            settings.dynamic_flow_information = temp
+
         return helpers.sorted_definitions(set(names))
 
     def call_signatures(self):
@@ -555,22 +540,12 @@ class Script(object):
         :rtype: list of :class:`classes.CallSignature`
         """
         user_stmt = self._parser.user_stmt_with_whitespace()
-        call, index = search_call_signatures(user_stmt, self._pos)
+        call, execution_arr, index = search_call_signatures(user_stmt, self._pos)
         if call is None:
             return []
 
-        stmt_el = call
-        while isinstance(stmt_el.parent, pr.StatementElement):
-            # Go to parent literal/variable until not possible anymore. This
-            # makes it possible to return the whole expression.
-            stmt_el = stmt_el.parent
-        # We can reset the execution since it's a new object
-        # (fast_parent_copy).
-        execution_arr, call.execution = call.execution, None
-
         with common.scale_speed_settings(settings.scale_call_signatures):
-            _callable = lambda: self._evaluator.eval_call(stmt_el)
-            origins = cache.cache_call_signatures(_callable, self.source,
+            origins = cache.cache_call_signatures(self._evaluator, call, self.source,
                                                   self._pos, user_stmt)
         debug.speed('func_call followed')
 
@@ -584,8 +559,8 @@ class Script(object):
                 key_name = unicode(detail[0][0].name)
             except (IndexError, AttributeError):
                 pass
-        return [classes.CallSignature(self._evaluator, o, call, index, key_name)
-                for o in origins if o.is_callable()]
+        return [classes.CallSignature(self._evaluator, o.name, call, index, key_name)
+                for o in origins if hasattr(o, 'py__call__')]
 
     def _analysis(self):
         #statements = set(chain(*self._parser.module().used_names.values()))
@@ -595,7 +570,7 @@ class Script(object):
             iw = imports.ImportWrapper(self._evaluator, i,
                                        nested_resolve=True).follow()
             if i.is_nested() and any(not isinstance(i, pr.Module) for i in iw):
-                analysis.add(self._evaluator, 'import-error', i.namespace.names[-1])
+                analysis.add(self._evaluator, 'import-error', i.namespace_names[-1])
         for stmt in sorted(stmts, key=lambda obj: obj.start_pos):
             if not (isinstance(stmt.parent, pr.ForFlow)
                     and stmt.parent.set_stmt == stmt):
@@ -702,6 +677,33 @@ def defined_names(source, path=None, encoding='utf-8'):
         module_path=path,
     )
     return classes.defined_names(Evaluator(), parser.module)
+
+
+def names(source=None, path=None, encoding='utf-8', all_scopes=False,
+          definitions=True, references=False):
+    """
+    Returns a list of `Definition` objects, containing name parts.
+    This means you can call ``Definition.goto_assignments()`` and get the
+    reference of a name.
+    The parameters are the same as in :py:class:`Script`, except or the
+    following ones:
+
+    :param all_scopes: If True lists the names of all scopes instead of only
+        the module namespace.
+    :param definitions: If True lists the names that have been defined by a
+        class, function or a statement (``a = b`` returns ``a``).
+    :param references: If True lists all the names that are not listed by
+        ``definitions=True``. E.g. ``a = b`` returns ``b``.
+    """
+    def def_ref_filter(_def):
+        is_def = _def.is_definition()
+        return definitions and is_def or references and not is_def
+
+    # Set line/column to a random position, because they don't matter.
+    script = Script(source, line=1, column=0, path=path, encoding=encoding)
+    defs = [classes.Definition(script._evaluator, name_part)
+            for name_part in get_module_name_parts(script._parser.module())]
+    return sorted(filter(def_ref_filter, defs), key=lambda x: (x.line, x.column))
 
 
 def preload_module(*modules):

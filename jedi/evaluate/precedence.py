@@ -1,13 +1,27 @@
 """
 Handles operator precedence.
 """
+import operator
 
 from jedi._compatibility import unicode
 from jedi.parser import representation as pr
 from jedi import debug
 from jedi.common import PushBackIterator
-from jedi.evaluate.compiled import CompiledObject, create, builtin
+from jedi.evaluate.compiled import (CompiledObject, create, builtin,
+                                    keyword_from_value, true_obj, false_obj)
 from jedi.evaluate import analysis
+
+# Maps Python syntax to the operator module.
+COMPARISON_OPERATORS = {
+    '==': operator.eq,
+    '!=': operator.ne,
+    'is': operator.is_,
+    'is not': operator.is_not,
+    '<': operator.lt,
+    '<=': operator.le,
+    '>': operator.gt,
+    '>=': operator.ge,
+}
 
 
 class PythonGrammar(object):
@@ -199,17 +213,48 @@ def _literals_to_types(evaluator, result):
         if is_literal(r):
             # Literals are only valid as long as the operations are
             # correct. Otherwise add a value-free instance.
-            cls = builtin.get_by_name(r.name)
+            cls = builtin.get_by_name(r.name.get_code())
             result[i] = evaluator.execute(cls)[0]
     return list(set(result))
+
+
+def process_precedence_element(evaluator, precedence):
+    if precedence is None:
+        return None
+    else:
+        if isinstance(precedence, Precedence):
+            left_objs = process_precedence_element(evaluator, precedence.left)
+            operator = precedence.operator
+            lazy_right = lambda: process_precedence_element(evaluator, precedence.right)
+            # handle lazy evaluation of and/or here.
+            if operator in ('and', 'or'):
+                left_bools = set([left.py__bool__() for left in left_objs])
+                if left_bools == set([True]):
+                    if operator == 'and':
+                        return lazy_right()
+                    else:
+                        return left_objs
+                elif left_bools == set([False]):
+                    if operator == 'and':
+                        return left_objs
+                    else:
+                        return lazy_right()
+                # Otherwise continue, because of uncertainty.
+            return calculate(evaluator, left_objs, precedence.operator,
+                             lazy_right())
+        else:
+            # normal element, no operators
+            return evaluator.eval_statement_element(precedence)
 
 
 def calculate(evaluator, left_result, operator, right_result):
     result = []
     if left_result is None and right_result:
-        # cases like `-1` or `1 + ~1`
+        # Cases like `-1`, `1 + ~1` or `not X`.
         for right in right_result:
-            result.append(_factor_calculate(evaluator, operator, right))
+            obj = _factor_calculate(evaluator, operator, right)
+            if obj is not None:
+                result.append(obj)
         return result
     else:
         if not left_result or not right_result:
@@ -233,6 +278,11 @@ def _factor_calculate(evaluator, operator, right):
     if _is_number(right):
         if operator == '-':
             return create(evaluator, -right.obj)
+    if operator == 'not':
+        value = right.py__bool__()
+        if value is None:  # Uncertainty.
+            return None
+        return keyword_from_value(not value)
     return right
 
 
@@ -241,13 +291,13 @@ def _is_number(obj):
         and isinstance(obj.obj, (int, float))
 
 
-def _is_string(obj):
+def is_string(obj):
     return isinstance(obj, CompiledObject) \
         and isinstance(obj.obj, (str, unicode))
 
 
 def is_literal(obj):
-    return _is_number(obj) or _is_string(obj)
+    return _is_number(obj) or is_string(obj)
 
 
 def _is_tuple(obj):
@@ -266,12 +316,12 @@ def _element_calculate(evaluator, left, operator, right):
     r_is_num = _is_number(right)
     if operator == '*':
         # for iterables, ignore * operations
-        if isinstance(left, iterable.Array) or _is_string(left):
+        if isinstance(left, iterable.Array) or is_string(left):
             return [left]
-        elif isinstance(right, iterable.Array) or _is_string(right):
+        elif isinstance(right, iterable.Array) or is_string(right):
             return [right]
     elif operator == '+':
-        if l_is_num and r_is_num or _is_string(left) and _is_string(right):
+        if l_is_num and r_is_num or is_string(left) and is_string(right):
             return [create(evaluator, left.obj + right.obj)]
         elif _is_tuple(left) and _is_tuple(right) or _is_list(left) and _is_list(right):
             return [iterable.MergedArray(evaluator, (left, right))]
@@ -282,10 +332,22 @@ def _element_calculate(evaluator, left, operator, right):
         # With strings and numbers the left type typically remains. Except for
         # `int() % float()`.
         return [left]
+    elif operator in COMPARISON_OPERATORS:
+        operation = COMPARISON_OPERATORS[operator]
+        if isinstance(left, CompiledObject) and isinstance(right, CompiledObject):
+            # Possible, because the return is not an option. Just compare.
+            left = left.obj
+            right = right.obj
+
+        try:
+            return [keyword_from_value(operation(left, right))]
+        except TypeError:
+            # Could be True or False.
+            return [true_obj, false_obj]
 
     def check(obj):
         """Checks if a Jedi object is either a float or an int."""
-        return isinstance(obj, er.Instance) and obj.name in ('int', 'float')
+        return isinstance(obj, er.Instance) and obj.name.get_code() in ('int', 'float')
 
     # Static analysis, one is a number, the other one is not.
     if operator in ('+', '-') and l_is_num != r_is_num \

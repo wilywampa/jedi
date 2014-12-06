@@ -5,12 +5,13 @@ import inspect
 import re
 import sys
 import os
+from functools import partial
 
 from jedi._compatibility import builtins as _builtins, unicode
 from jedi import debug
 from jedi.cache import underscore_memoization, memoize
 from jedi.evaluate.sys_path import get_sys_path
-from jedi.parser.representation import Param, SubModule, Base, IsScope, Operator
+from jedi.parser.representation import Param, SubModule, Base, Operator
 from jedi.evaluate.helpers import FakeName
 from . import fake
 
@@ -22,6 +23,19 @@ _path_re = re.compile('(?:\.[^{0}]+|[{0}]__init__\.py)$'.format(re.escape(_sep))
 del _sep
 
 
+class CheckAttribute(object):
+    """Raises an AttributeError if the attribute X isn't available."""
+    def __init__(self, func):
+        self.func = func
+        # Remove the py in front of e.g. py__call__.
+        self.check_name = func.__name__[2:]
+
+    def __get__(self, instance, owner):
+        # This might raise an AttributeError. That's wanted.
+        getattr(instance.obj, self.check_name)
+        return partial(self.func, instance)
+
+
 class CompiledObject(Base):
     # comply with the parser
     start_pos = 0, 0
@@ -31,6 +45,37 @@ class CompiledObject(Base):
     def __init__(self, obj, parent=None):
         self.obj = obj
         self.parent = parent
+
+    @property
+    def py__call__(self):
+        def actual(evaluator, params):
+            if inspect.isclass(self.obj):
+                from jedi.evaluate.representation import Instance
+                return [Instance(evaluator, self, params)]
+            else:
+                return list(self._execute_function(evaluator, params))
+
+        # Might raise an AttributeError, which is intentional.
+        self.obj.__call__
+        return actual
+
+    @CheckAttribute
+    def py__class__(self, evaluator):
+        return CompiledObject(self.obj.__class__, parent=self.parent)
+
+    @CheckAttribute
+    def py__mro__(self, evaluator):
+        return tuple(create(evaluator, cls) for cls in self.obj.__mro__)
+
+    @CheckAttribute
+    def py__bases__(self, evaluator):
+        return tuple(create(evaluator, cls) for cls in self.obj.__bases__)
+
+    def py__bool__(self):
+        return bool(self.obj)
+
+    def is_class(self):
+        return inspect.isclass(self.obj)
 
     @property
     def doc(self):
@@ -64,6 +109,9 @@ class CompiledObject(Base):
         return _parse_function_doc(self.doc)
 
     def type(self):
+        if fake.is_class_instance(self.obj):
+            return 'instance'
+
         cls = self._cls().obj
         if inspect.isclass(cls):
             return 'class'
@@ -72,9 +120,6 @@ class CompiledObject(Base):
         elif inspect.isbuiltin(cls) or inspect.ismethod(cls) \
                 or inspect.ismethoddescriptor(cls):
             return 'function'
-
-    def is_executable_class(self):
-        return inspect.isclass(self.obj)
 
     @underscore_memoization
     def _cls(self):
@@ -95,7 +140,7 @@ class CompiledObject(Base):
         else:
             return type_names + self.instance_names()
 
-    def scope_names_generator(self, position=None):
+    def scope_names_generator(self, position=None, add_class_vars=True):
         yield self, self.get_defined_names()
 
     @underscore_memoization
@@ -146,9 +191,9 @@ class CompiledObject(Base):
     @property
     def name(self):
         # might not exist sometimes (raises AttributeError)
-        return self._cls().obj.__name__
+        return FakeName(self._cls().obj.__name__, self)
 
-    def execute_function(self, evaluator, params):
+    def _execute_function(self, evaluator, params):
         if self.type() != 'function':
             return
 
@@ -158,13 +203,11 @@ class CompiledObject(Base):
             except AttributeError:
                 continue
             else:
-                if isinstance(bltn_obj, CompiledObject):
+                if isinstance(bltn_obj, CompiledObject) and bltn_obj.obj is None:
                     # We want everything except None.
-                    if bltn_obj.obj is not None:
-                        yield bltn_obj
-                else:
-                    for result in evaluator.execute(bltn_obj, params):
-                        yield result
+                    continue
+                for result in evaluator.execute(bltn_obj, params):
+                    yield result
 
     @property
     @underscore_memoization
@@ -191,17 +234,12 @@ class CompiledObject(Base):
     def get_imports(self):
         return []  # Builtins don't have imports
 
-    def is_callable(self):
-        """Check if the object has a ``__call__`` method."""
-        return hasattr(self.obj, '__call__')
-
 
 class CompiledName(FakeName):
     def __init__(self, obj, name):
         super(CompiledName, self).__init__(name)
         self._obj = obj
         self.name = name
-        self.start_pos = 0, 0  # an illegal start_pos, to make sorting easy.
 
     def __repr__(self):
         try:
@@ -244,8 +282,7 @@ def dotted_from_fs_path(fs_path, sys_path=None):
     #     C:\path\to\Lib
     path = ''
     for s in sys_path:
-        if (fs_path.startswith(s) and
-            len(path) < len(s)):
+        if (fs_path.startswith(s) and len(path) < len(s)):
             path = s
     return _path_re.sub('', fs_path[len(path):].lstrip(os.path.sep)).replace(os.path.sep, '.')
 
@@ -285,7 +322,14 @@ def load_module(path, name):
         sys_path.insert(0, p)
 
     temp, sys.path = sys.path, sys_path
-    __import__(dotted_path)
+    try:
+        __import__(dotted_path)
+    except RuntimeError:
+        if 'PySide' in dotted_path or 'PyQt' in dotted_path:
+            # RuntimeError: the PyQt4.QtCore and PyQt5.QtCore modules both wrap
+            # the QObject class.
+            # See https://github.com/davidhalter/jedi/pull/483
+            return None
     # Just access the cache after import, because of #59 as well as the very
     # complicated import structure of Python.
     module = sys.modules[dotted_path]
@@ -362,11 +406,14 @@ def _parse_function_doc(doc):
     return param_str, ret
 
 
-class Builtin(CompiledObject, IsScope):
+class Builtin(CompiledObject, Base):
     @memoize
     def get_by_name(self, name):
         item = [n for n in self.get_defined_names() if n.get_code() == name][0]
         return item.parent
+
+    def is_scope(self):
+        return True
 
 
 def _a_generator(foo):
@@ -397,6 +444,21 @@ magic_function_class = CompiledObject(type(load_module), parent=builtin)
 generator_obj = CompiledObject(_a_generator(1.0))
 type_names = []  # Need this, because it's return in get_defined_names.
 type_names = builtin.get_by_name('type').get_defined_names()
+none_obj = builtin.get_by_name('None')
+false_obj = builtin.get_by_name('False')
+true_obj = builtin.get_by_name('True')
+object_obj = builtin.get_by_name('object')
+
+
+def keyword_from_value(obj):
+    if obj is None:
+        return none_obj
+    elif obj is False:
+        return false_obj
+    elif obj is True:
+        return true_obj
+    else:
+        raise NotImplementedError
 
 
 def compiled_objects_cache(func):
@@ -425,5 +487,11 @@ def create(evaluator, obj, parent=builtin, module=None):
         if faked is not None:
             faked.parent = parent
             return faked
+
+    try:
+        if obj.__module__ in ('builtins', '__builtin__'):
+            return builtin.get_by_name(obj.__name__)
+    except AttributeError:
+        pass
 
     return CompiledObject(obj, parent)

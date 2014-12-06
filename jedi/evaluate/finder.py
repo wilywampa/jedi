@@ -1,5 +1,5 @@
 """
-Searcjing for names with given scope and name. This is very central in Jedi and
+Searching for names with given scope and name. This is very central in Jedi and
 Python. The name resolution is quite complicated with descripter,
 ``__getattribute__``, ``__getattr__``, ``global``, etc.
 
@@ -26,7 +26,7 @@ from jedi.evaluate import docstrings
 from jedi.evaluate import iterable
 from jedi.evaluate import imports
 from jedi.evaluate import analysis
-from jedi.evaluate import precedence
+from jedi.evaluate import flow_analysis
 
 
 class NameFinder(object):
@@ -38,16 +38,11 @@ class NameFinder(object):
 
     @debug.increase_indent
     def find(self, scopes, resolve_decorator=True, search_global=False):
-        if unicode(self.name_str) == 'None':
-            # Filter None, because it's really just a keyword, nobody wants to
-            # access it.
-            return []
-
         names = self.filter_name(scopes)
         types = self._names_to_types(names, resolve_decorator)
 
         if not names and not types \
-                and not (isinstance(self.name_str, pr.NamePart)
+                and not (isinstance(self.name_str, pr.Name)
                          and isinstance(self.name_str.parent.parent, pr.Param)):
             if not isinstance(self.name_str, (str, unicode)):  # TODO Remove?
                 if search_global:
@@ -73,7 +68,11 @@ class NameFinder(object):
         Filters all variables of a scope (which are defined in the
         `scope_names_generator`), until the name fits.
         """
-        result = []
+        # TODO Now this import is really ugly. Try to remove it.
+        # It's possibly the only api dependency.
+        from jedi.api.interpreter import InterpreterNamespace
+        names = []
+        self.maybe_descriptor = isinstance(self.scope, er.Class)
         for name_list_scope, name_list in scope_names_generator:
             break_scopes = []
             if not isinstance(name_list_scope, compiled.CompiledObject):
@@ -86,32 +85,70 @@ class NameFinder(object):
                 if unicode(self.name_str) != name.get_code():
                     continue
 
-                scope = name.parent.parent
+                stmt = name.get_definition()
+                scope = stmt.parent
                 if scope in break_scopes:
                     continue
 
                 # Exclude `arr[1] =` from the result set.
-                if not self._name_is_array_assignment(name):
-                    result.append(name)
+                if not self._name_is_array_assignment(name, stmt):
+                    # TODO we ignore a lot of elements here that should not be
+                    #   ignored. But then again flow_analysis also stops when the
+                    #   input scope is reached. This is not correct: variables
+                    #   might still have conditions if defined outside of the
+                    #   current scope.
+                    if isinstance(stmt, (pr.Param, pr.Import)) \
+                            or isinstance(name_list_scope, (pr.Lambda, pr.ListComprehension, er.Instance, InterpreterNamespace)) \
+                            or isinstance(scope, compiled.CompiledObject) \
+                            or isinstance(stmt, pr.ExprStmt) and stmt.is_global():
+                        # Always reachable.
+                        names.append(name)
+                    else:
+                        check = flow_analysis.break_check(self._evaluator,
+                                                          name_list_scope,
+                                                          er.wrap(self._evaluator, scope),
+                                                          self.scope)
+                        if check is not flow_analysis.UNREACHABLE:
+                            names.append(name)
+                        if check is flow_analysis.REACHABLE:
+                            break
 
-                if result and self._is_name_break_scope(name):
+                if names and self._is_name_break_scope(stmt):
                     if self._does_scope_break_immediately(scope, name_list_scope):
                         break
                     else:
                         break_scopes.append(scope)
-            if result:
+            if names:
                 break
+
+            if isinstance(self.scope, er.Instance):
+                # After checking the dictionary of an instance (self
+                # attributes), an attribute maybe a descriptor.
+                self.maybe_descriptor = True
 
         scope_txt = (self.scope if self.scope == name_list_scope
                      else '%s-%s' % (self.scope, name_list_scope))
         debug.dbg('finder.filter_name "%s" in (%s): %s@%s', self.name_str,
-                  scope_txt, u(result), self.position)
-        return result
+                  scope_txt, u(names), self.position)
+        return list(self._clean_names(names))
+
+    def _clean_names(self, names):
+        """
+        ``NameFinder.filter_name`` should only output names with correct
+        wrapper parents. We don't want to see AST classes out in the
+        evaluation, so remove them already here!
+        """
+        for n in names:
+            definition = n.parent
+            if isinstance(definition, (pr.Function, pr.Class, pr.Module)):
+                yield er.wrap(self._evaluator, definition).name
+            else:
+                yield n
 
     def _check_getattr(self, inst):
         """Checks for both __getattr__ and __getattribute__ methods"""
         result = []
-        # str is important to lose the NamePart!
+        # str is important, because it shouldn't be `Name`!
         name = compiled.create(self._evaluator, str(self.name_str))
         with common.ignored(KeyError):
             result = inst.execute_subscope_by_name('__getattr__', [name])
@@ -124,15 +161,14 @@ class NameFinder(object):
                 result = inst.execute_subscope_by_name('__getattribute__', [name])
         return result
 
-    def _is_name_break_scope(self, name):
+    def _is_name_break_scope(self, stmt):
         """
         Returns True except for nested imports and instance variables.
         """
-        par = name.parent
-        if par.isinstance(pr.Statement):
-            if isinstance(name, er.InstanceElement) and not name.is_class_var:
+        if stmt.isinstance(pr.ExprStmt):
+            if isinstance(stmt, er.InstanceElement) and not stmt.is_class_var:
                 return False
-        elif isinstance(par, pr.Import) and par.is_nested():
+        elif isinstance(stmt, pr.Import) and stmt.is_nested():
             return False
         return True
 
@@ -145,31 +181,14 @@ class NameFinder(object):
         if isinstance(scope, pr.Flow) \
                 or isinstance(scope, pr.KeywordStatement) and scope.name == 'global':
 
-            # Check for `if foo is not None`, because Jedi is not interested in
-            # None values, so this is the only branch we actually care about.
-            # ATM it carries the same issue as the isinstance checks. It
-            # doesn't work with instance variables (self.foo).
-            if isinstance(scope, pr.Flow) and scope.command in ('if', 'while'):
-                try:
-                    expression_list = scope.inputs[0].expression_list()
-                except IndexError:
-                    pass
-                else:
-                    p = precedence.create_precedence(expression_list)
-                    if (isinstance(p, precedence.Precedence)
-                            and p.operator.string == 'is not'
-                            and p.right.get_code() == 'None'
-                            and p.left.get_code() == unicode(self.name_str)):
-                        return True
-
             if isinstance(name_list_scope, er.Class):
                 name_list_scope = name_list_scope.base
             return scope == name_list_scope
         else:
             return True
 
-    def _name_is_array_assignment(self, name):
-        if name.parent.isinstance(pr.Statement):
+    def _name_is_array_assignment(self, name, stmt):
+        if stmt.isinstance(pr.ExprStmt):
             def is_execution(calls):
                 for c in calls:
                     if isinstance(c, (unicode, str, tokenize.Token)):
@@ -181,12 +200,12 @@ class NameFinder(object):
                         # Compare start_pos, because names may be different
                         # because of executions.
                         if c.name.start_pos == name.start_pos \
-                                and c.execution:
+                                and isinstance(c.next, pr.Array):
                             return True
                 return False
 
             is_exe = False
-            for assignee, op in name.parent.assignment_details:
+            for assignee, op in stmt.assignment_details:
                 is_exe |= is_execution(assignee)
 
             if is_exe:
@@ -197,37 +216,34 @@ class NameFinder(object):
 
     def _names_to_types(self, names, resolve_decorator):
         types = []
-        # Add isinstance and other if/assert knowledge.
-        flow_scope = self.scope
         evaluator = self._evaluator
-        while flow_scope:
-            # TODO check if result is in scope -> no evaluation necessary
-            n = check_flow_information(evaluator, flow_scope,
-                                       self.name_str, self.position)
-            if n:
-                return n
-            flow_scope = flow_scope.parent
+
+        # Add isinstance and other if/assert knowledge.
+        if isinstance(self.name_str, pr.Name):
+            flow_scope = self.name_str.parent.parent
+            # Ignore FunctionExecution parents for now.
+            until = flow_scope.get_parent_until(er.FunctionExecution)
+            while flow_scope and not isinstance(until, er.FunctionExecution):
+                # TODO check if result is in scope -> no evaluation necessary
+                n = check_flow_information(evaluator, flow_scope,
+                                           self.name_str, self.position)
+                if n:
+                    return n
+                flow_scope = flow_scope.parent
 
         for name in names:
-            typ = name.parent
+            typ = name.get_definition()
             if typ.isinstance(pr.ForFlow):
                 types += self._handle_for_loops(typ)
             elif isinstance(typ, pr.Param):
                 types += self._eval_param(typ)
-            elif typ.isinstance(pr.Statement):
+            elif typ.isinstance(pr.ExprStmt):
                 if typ.is_global():
                     # global keyword handling.
                     types += evaluator.find_types(typ.parent.parent, str(name))
                 else:
                     types += self._remove_statements(typ, name)
             else:
-                if isinstance(typ, pr.Class):
-                    typ = er.Class(evaluator, typ)
-                elif isinstance(typ, pr.Function):
-                    typ = er.Function(evaluator, typ)
-                elif isinstance(typ, pr.Module):
-                    typ = er.ModuleWrapper(evaluator, typ)
-
                 if typ.isinstance(er.Function) and resolve_decorator:
                     typ = typ.get_decorated_func()
                 types.append(typ)
@@ -262,16 +278,20 @@ class NameFinder(object):
         # check for `except X as y` usages, because y needs to be instantiated.
         p = stmt.parent
         # TODO this looks really hacky, improve parser representation!
-        if isinstance(p, pr.Flow) and p.command == 'except' \
-                and p.inputs and p.inputs[0].as_names == [name]:
-            # TODO check for types that are not classes and add it to the
-            # static analysis report.
-            types = list(chain.from_iterable(
-                         evaluator.execute(t) for t in types))
+        if isinstance(p, pr.Flow) and p.command == 'except' and p.inputs:
+            as_names = p.inputs[0].as_names
+            try:
+                if as_names[0] == name:
+                    # TODO check for types that are not classes and add it to
+                    # the static analysis report.
+                    types = list(chain.from_iterable(
+                                 evaluator.execute(t) for t in types))
+            except IndexError:
+                pass
 
         if check_instance is not None:
             # class renames
-            types = [er.InstanceElement(evaluator, check_instance, a, True)
+            types = [er.get_instance_el(evaluator, check_instance, a, True)
                      if isinstance(a, (er.Function, pr.Function))
                      else a for a in types]
         return types
@@ -334,6 +354,8 @@ class NameFinder(object):
 
     def _resolve_descriptors(self, types):
         """Processes descriptors"""
+        if not self.maybe_descriptor:
+            return types
         result = []
         for r in types:
             if isinstance(self.scope, (er.Instance, er.Class)) \
@@ -359,7 +381,7 @@ def check_flow_information(evaluator, flow, search_name_part, pos):
         return None
 
     result = []
-    if isinstance(flow, pr.IsScope) and not result:
+    if flow.is_scope():
         for ass in reversed(flow.asserts):
             if pos is None or ass.start_pos > pos:
                 continue
@@ -373,25 +395,29 @@ def check_flow_information(evaluator, flow, search_name_part, pos):
     return result
 
 
-def _check_isinstance_type(evaluator, stmt, search_name_part):
+def _check_isinstance_type(evaluator, stmt, search_name):
     try:
         expression_list = stmt.expression_list()
         # this might be removed if we analyze and, etc
         assert len(expression_list) == 1
         call = expression_list[0]
         assert isinstance(call, pr.Call) and str(call.name) == 'isinstance'
-        assert bool(call.execution)
+        assert call.next_is_execution()
 
         # isinstance check
-        isinst = call.execution.values
+        isinst = call.next.values
         assert len(isinst) == 2  # has two params
         obj, classes = [statement.expression_list() for statement in isinst]
         assert len(obj) == 1
         assert len(classes) == 1
         assert isinstance(obj[0], pr.Call)
 
-        # names fit?
-        assert unicode(obj[0].name) == unicode(search_name_part)
+        prev = search_name.parent
+        while prev.previous is not None:
+            prev = prev.previous
+        # Do a simple get_code comparison. They should just have the same code,
+        # and everything will be all right.
+        assert obj[0].get_code() == prev.get_code()
         assert isinstance(classes[0], pr.StatementElement)  # can be type or tuple
     except AssertionError:
         return []
@@ -440,7 +466,7 @@ def get_names_of_scope(evaluator, scope, position=None, star_search=True, includ
     After that we have a few underscore names that have been defined
 
     >>> pairs[2]
-    (<ModuleWrapper: <SubModule: None@1-5>>, [<FakeName: __file__@0,0>, ...])
+    (<ModuleWrapper: <SubModule: None@1-5>>, [<LazyName: __file__@0,0>, ...])
 
 
     Finally, it yields names from builtin, if `include_builtin` is
@@ -561,7 +587,7 @@ def find_assignments(lhs, results, seek_name):
     """
     if isinstance(lhs, pr.Array):
         return _assign_tuples(lhs, results, seek_name)
-    elif unicode(lhs.name.names[-1]) == seek_name:
+    elif unicode(lhs.name) == seek_name:
         return results
     else:
         return []

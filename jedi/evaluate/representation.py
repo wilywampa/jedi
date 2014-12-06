@@ -1,5 +1,5 @@
 """
-Like described in the :mod:`jedi.evaluate.parsing_representation` module,
+Like described in the :mod:`jedi.parser.representation` module,
 there's a need for an ast like module to represent the states of parsed
 modules.
 
@@ -9,16 +9,33 @@ instantiated. This class represents these cases.
 
 So, why is there also a ``Class`` class here? Well, there are decorators and
 they change classes in Python 3.
+
+Representation modules also define "magic methods". Those methods look like
+``py__foo__`` and are typically mappable to the Python equivalents ``__call__``
+and others. Here's a list:
+
+====================================== ========================================
+**Method**                             **Description**
+-------------------------------------- ----------------------------------------
+py__call__(evaluator, params: Array)   On callable objects, returns types.
+py__bool__()                           Returns True/False/None; None means that
+                                       there's no certainty.
+py__bases__(evaluator)                 Returns a list of base classes.
+py__mro__(evaluator)                   Returns a list of classes (the mro).
+====================================== ========================================
+
+__
 """
 import copy
 import os
 import pkgutil
 
-from jedi._compatibility import use_metaclass, unicode
+from jedi._compatibility import use_metaclass, unicode, Python3Method
 from jedi.parser import representation as pr
 from jedi.parser.tokenize import Token
 from jedi import debug
 from jedi import common
+from jedi.cache import underscore_memoization
 from jedi.evaluate.cache import memoize_default, CachedMetaClass
 from jedi.evaluate import compiled
 from jedi.evaluate import recursion
@@ -26,9 +43,22 @@ from jedi.evaluate import iterable
 from jedi.evaluate import docstrings
 from jedi.evaluate import helpers
 from jedi.evaluate import param
+from jedi.evaluate import flow_analysis
 
 
-class Executable(pr.IsScope):
+def wrap(evaluator, element):
+    if isinstance(element, pr.Class):
+        return Class(evaluator, element)
+    elif isinstance(element, pr.Function):
+        return Function(evaluator, element)
+    elif isinstance(element, (pr.Module)) \
+            and not isinstance(element, ModuleWrapper):
+        return ModuleWrapper(evaluator, element)
+    else:
+        return element
+
+
+class Executed(pr.Base):
     """
     An instance is also an executable - because __init__ is called
     :param var_args: The param input array, consist of `pr.Array` or list.
@@ -38,6 +68,9 @@ class Executable(pr.IsScope):
         self.base = base
         self.var_args = var_args
 
+    def is_scope(self):
+        return True
+
     def get_parent_until(self, *args, **kwargs):
         return self.base.get_parent_until(*args, **kwargs)
 
@@ -46,18 +79,18 @@ class Executable(pr.IsScope):
         return self.base.parent
 
 
-class Instance(use_metaclass(CachedMetaClass, Executable)):
+class Instance(use_metaclass(CachedMetaClass, Executed)):
     """
     This class is used to evaluate instances.
     """
     def __init__(self, evaluator, base, var_args=()):
         super(Instance, self).__init__(evaluator, base, var_args)
-        if str(base.name) in ['list', 'set'] \
+        if base.name.get_code() in ['list', 'set'] \
                 and compiled.builtin == base.get_parent_until():
             # compare the module path with the builtin name.
             self.var_args = iterable.check_array_instances(evaluator, self)
         else:
-            # need to execute the __init__ function, because the dynamic param
+            # Need to execute the __init__ function, because the dynamic param
             # searching needs it.
             with common.ignored(KeyError):
                 self.execute_subscope_by_name('__init__', self.var_args)
@@ -65,9 +98,29 @@ class Instance(use_metaclass(CachedMetaClass, Executable)):
         # (No var_args) used.
         self.is_generated = False
 
+    @property
+    def py__call__(self):
+        def actual(evaluator, params):
+            return evaluator.execute(method, params)
+
+        try:
+            method = self.get_subscope_by_name('__call__')
+        except KeyError:
+            # Means the Instance is not callable.
+            raise AttributeError
+
+        return actual
+
+    def py__class__(self, evaluator):
+        return self.base
+
+    def py__bool__(self):
+        # Signalize that we don't know about the bool type.
+        return None
+
     @memoize_default()
     def _get_method_execution(self, func):
-        func = InstanceElement(self._evaluator, self, func, True)
+        func = get_instance_el(self._evaluator, self, func, True)
         return FunctionExecution(self._evaluator, func, self.var_args)
 
     def _get_func_self_name(self, func):
@@ -90,7 +143,7 @@ class Instance(use_metaclass(CachedMetaClass, Executable)):
             n = copy.copy(name)
             n.names = n.names[1:]
             n._get_code = unicode(n.names[-1])
-            names.append(InstanceElement(self._evaluator, self, n))
+            names.append(get_instance_el(self._evaluator, self, n))
 
         names = []
         # This loop adds the names of the self object, copies them and removes
@@ -111,22 +164,24 @@ class Instance(use_metaclass(CachedMetaClass, Executable)):
                     # because to follow them and their self variables is too
                     # complicated.
                     sub = self._get_method_execution(sub)
-            for n in sub.get_defined_names():
-                # Only names with the selfname are being added.
-                # It is also important, that they have a len() of 2,
-                # because otherwise, they are just something else
-                if unicode(n.names[0]) == self_name and len(n.names) == 2:
-                    add_self_dot_name(n)
+            for per_name_list in sub.get_names_dict().values():
+                for call in per_name_list:
+                    if unicode(call.name) == self_name \
+                            and isinstance(call.next, pr.Call) \
+                            and call.next.next is None:
+                        names.append(get_instance_el(self._evaluator, self, call.next.name))
+                    #if unicode(n.names[0]) == self_name and len(n.names) == 2:
+                    #    add_self_dot_name(n)
 
-        if not isinstance(self.base, compiled.CompiledObject):
-            for s in self.base.get_super_classes():
+        for s in self.base.py__bases__(self._evaluator):
+            if not isinstance(s, compiled.CompiledObject):
                 for inst in self._evaluator.execute(s):
                     names += inst.get_self_attributes()
         return names
 
     def get_subscope_by_name(self, name):
         sub = self.base.get_subscope_by_name(name)
-        return InstanceElement(self._evaluator, self, sub, True)
+        return get_instance_el(self._evaluator, self, sub, True)
 
     def execute_subscope_by_name(self, name, args=()):
         method = self.get_subscope_by_name(name)
@@ -136,7 +191,7 @@ class Instance(use_metaclass(CachedMetaClass, Executable)):
         """ Throws a KeyError if there's no method. """
         # Arguments in __get__ descriptors are obj, class.
         # `method` is the new parent of the array, don't know if that's good.
-        args = [obj, obj.base] if isinstance(obj, Instance) else [None, obj]
+        args = [obj, obj.base] if isinstance(obj, Instance) else [compiled.none_obj, obj]
         return self.execute_subscope_by_name('__get__', args)
 
     def scope_names_generator(self, position=None):
@@ -146,17 +201,9 @@ class Instance(use_metaclass(CachedMetaClass, Executable)):
         """
         yield self, self.get_self_attributes()
 
-        names = []
-        for var in self.base.instance_names():
-            names.append(InstanceElement(self._evaluator, self, var, True))
-        yield self, names
-
-    def is_callable(self):
-        try:
-            self.get_subscope_by_name('__call__')
-            return True
-        except KeyError:
-            return False
+        for scope, names in self.base.scope_names_generator(add_class_vars=False):
+            yield self, [get_instance_el(self._evaluator, self, var, True)
+                         for var in names]
 
     def get_index_types(self, index_array):
 
@@ -174,8 +221,14 @@ class Instance(use_metaclass(CachedMetaClass, Executable)):
             debug.warning('No __getitem__, cannot access the array.')
             return []
 
+    @property
+    @underscore_memoization
+    def name(self):
+        name = self.base.name
+        return helpers.FakeName(unicode(name), self, name.start_pos)
+
     def __getattr__(self, name):
-        if name not in ['start_pos', 'end_pos', 'name', 'get_imports',
+        if name not in ['start_pos', 'end_pos', 'get_imports',
                         'doc', 'raw_doc', 'asserts']:
             raise AttributeError("Instance %s: Don't touch this (%s)!"
                                  % (self, name))
@@ -186,17 +239,31 @@ class Instance(use_metaclass(CachedMetaClass, Executable)):
             (type(self).__name__, self.base, len(self.var_args or []))
 
 
+def get_instance_el(evaluator, instance, var, is_class_var=False):
+    """
+    Returns an InstanceElement if it makes sense, otherwise leaves the object
+    untouched.
+    """
+    if isinstance(var, (Instance, compiled.CompiledObject, pr.Operator, Token,
+                        pr.Module, FunctionExecution, pr.Name)):
+        if isinstance(var, pr.Name):
+            # TODO temp solution, remove later, Name should never get
+            #     here?
+            par = get_instance_el(evaluator, instance, var.parent, is_class_var)
+            return pr.Name(var._sub_module, unicode(var), par, var.start_pos)
+        return var
+
+    var = wrap(evaluator, var)
+    return InstanceElement(evaluator, instance, var, is_class_var)
+
+
 class InstanceElement(use_metaclass(CachedMetaClass, pr.Base)):
     """
     InstanceElement is a wrapper for any object, that is used as an instance
     variable (e.g. self.variable or class methods).
     """
-    def __init__(self, evaluator, instance, var, is_class_var=False):
+    def __init__(self, evaluator, instance, var, is_class_var):
         self._evaluator = evaluator
-        if isinstance(var, pr.Function):
-            var = Function(evaluator, var)
-        elif isinstance(var, pr.Class):
-            var = Class(evaluator, var)
         self.instance = instance
         self.var = var
         self.is_class_var = is_class_var
@@ -209,32 +276,44 @@ class InstanceElement(use_metaclass(CachedMetaClass, pr.Base)):
                 or isinstance(par, pr.Class) \
                 and par == self.instance.base.base:
             par = self.instance
-        elif not isinstance(par, (pr.Module, compiled.CompiledObject)):
-            par = InstanceElement(self.instance._evaluator, self.instance, par, self.is_class_var)
+        else:
+            par = get_instance_el(self._evaluator, self.instance, par,
+                                  self.is_class_var)
         return par
 
     def get_parent_until(self, *args, **kwargs):
+        if isinstance(self.var, pr.Name):
+            # TODO Name should never even be InstanceElements
+            return pr.Simple.get_parent_until(self.parent, *args, **kwargs)
         return pr.Simple.get_parent_until(self, *args, **kwargs)
+
+    def get_definition(self):
+        return self.get_parent_until((pr.ExprStmt, pr.IsScope, pr.Import))
 
     def get_decorated_func(self):
         """ Needed because the InstanceElement should not be stripped """
         func = self.var.get_decorated_func()
-        func = InstanceElement(self._evaluator, self.instance, func)
+        func = get_instance_el(self._evaluator, self.instance, func)
         return func
 
     def expression_list(self):
         # Copy and modify the array.
-        return [InstanceElement(self._evaluator, self.instance, command, self.is_class_var)
-                if not isinstance(command, (pr.Operator, Token)) else command
+        return [get_instance_el(self._evaluator, self.instance, command, self.is_class_var)
                 for command in self.var.expression_list()]
+
+    @property
+    @underscore_memoization
+    def name(self):
+        name = self.var.name
+        return helpers.FakeName(unicode(name), self, name.start_pos)
 
     def __iter__(self):
         for el in self.var.__iter__():
-            yield InstanceElement(self.instance._evaluator, self.instance, el,
+            yield get_instance_el(self._evaluator, self.instance, el,
                                   self.is_class_var)
 
     def __getitem__(self, index):
-        return InstanceElement(self._evaluator, self.instance, self.var[index],
+        return get_instance_el(self._evaluator, self.instance, self.var[index],
                                self.is_class_var)
 
     def __getattr__(self, name):
@@ -243,14 +322,34 @@ class InstanceElement(use_metaclass(CachedMetaClass, pr.Base)):
     def isinstance(self, *cls):
         return isinstance(self.var, cls)
 
-    def is_callable(self):
-        return self.var.is_callable()
+    def is_scope(self):
+        """
+        Since we inherit from Base, it would overwrite the action we want here.
+        """
+        return self.var.is_scope()
+
+    def py__call__(self, evaluator, params):
+        return Function.py__call__(self, evaluator, params)
 
     def __repr__(self):
         return "<%s of %s>" % (type(self).__name__, self.var)
 
 
-class Class(use_metaclass(CachedMetaClass, pr.IsScope)):
+class Wrapper(pr.Base):
+    def is_scope(self):
+        return True
+
+    def is_class(self):
+        return False
+
+    @property
+    @underscore_memoization
+    def name(self):
+        name = self.base.name
+        return helpers.FakeName(unicode(name), self, name.start_pos)
+
+
+class Class(use_metaclass(CachedMetaClass, Wrapper)):
     """
     This class is not only important to extend `pr.Class`, it is also a
     important for descriptors (if the descriptor methods are evaluated or not).
@@ -260,9 +359,25 @@ class Class(use_metaclass(CachedMetaClass, pr.IsScope)):
         self.base = base
 
     @memoize_default(default=())
-    def get_super_classes(self):
+    def py__mro__(self, evaluator):
+        def add(cls):
+            if cls not in mro:
+                mro.append(cls)
+
+        mro = [self]
+        # TODO Do a proper mro resolution. Currently we are just listing
+        # classes. However, it's a complicated algorithm.
+        for cls in self.py__bases__(self._evaluator):
+            # TODO detect for TypeError: duplicate base class str,
+            # e.g.  `class X(str, str): pass`
+            add(cls)
+            for cls_new in cls.py__mro__(evaluator):
+                add(cls_new)
+        return tuple(mro)
+
+    @memoize_default(default=())
+    def py__bases__(self, evaluator):
         supers = []
-        # TODO care for mro stuff (multiple super classes).
         for s in self.base.supers:
             # Super classes are statements.
             for cls in self._evaluator.eval_statement(s):
@@ -270,13 +385,19 @@ class Class(use_metaclass(CachedMetaClass, pr.IsScope)):
                     debug.warning('Received non class as a super class.')
                     continue  # Just ignore other stuff (user input error).
                 supers.append(cls)
-        if not supers and self.base.parent != compiled.builtin:
-            # add `object` to classes
-            supers += self._evaluator.find_types(compiled.builtin, 'object')
+
+        if not supers:
+            # Add `object` to classes (implicit in Python 3.)
+            supers.append(compiled.object_obj)
         return supers
 
-    @memoize_default(default=())
-    def instance_names(self):
+    def py__call__(self, evaluator, params):
+        return [Instance(evaluator, self, params)]
+
+    def py__getattribute__(self, name):
+        return self._evaluator.find_types(self, name)
+
+    def scope_names_generator(self, position=None, add_class_vars=True):
         def in_iterable(name, iterable):
             """ checks if the name is in the variable 'iterable'. """
             for i in iterable:
@@ -286,34 +407,29 @@ class Class(use_metaclass(CachedMetaClass, pr.IsScope)):
                     return True
             return False
 
-        result = self.base.get_defined_names()
-        super_result = []
-        # TODO mro!
-        for cls in self.get_super_classes():
-            # Get the inherited names.
-            for i in cls.instance_names():
-                if not in_iterable(i, result):
-                    super_result.append(i)
-        result += super_result
-        return result
+        all_names = []
+        for cls in self.py__mro__(self._evaluator):
+            names = []
+            if isinstance(cls, compiled.CompiledObject):
+                x = cls.instance_names()
+            else:
+                x = reversed(cls.base.get_defined_names())
+            for n in x:
+                if not in_iterable(n, all_names):
+                    names.append(n)
+            yield cls, names
+        if add_class_vars:
+            yield self, compiled.type_names
 
-    def scope_names_generator(self, position=None):
-        yield self, self.instance_names()
-        yield self, compiled.type_names
+    def is_class(self):
+        return True
 
     def get_subscope_by_name(self, name):
-        for s in [self] + self.get_super_classes():
+        for s in [self] + self.py__bases__(self._evaluator):
             for sub in reversed(s.subscopes):
                 if sub.name.get_code() == name:
                     return sub
         raise KeyError("Couldn't find subscope.")
-
-    def is_callable(self):
-        return True
-
-    @common.safe_property
-    def name(self):
-        return self.base.name
 
     def __getattr__(self, name):
         if name not in ['start_pos', 'end_pos', 'parent', 'asserts', 'raw_doc',
@@ -326,14 +442,14 @@ class Class(use_metaclass(CachedMetaClass, pr.IsScope)):
         return "<e%s of %s>" % (type(self).__name__, self.base)
 
 
-class Function(use_metaclass(CachedMetaClass, pr.IsScope)):
+class Function(use_metaclass(CachedMetaClass, Wrapper)):
     """
     Needed because of decorators. Decorators are evaluated here.
     """
     def __init__(self, evaluator, func, is_decorated=False):
         """ This should not be called directly """
         self._evaluator = evaluator
-        self.base_func = func
+        self.base = self.base_func = func
         self.is_decorated = is_decorated
 
     @memoize_default()
@@ -392,7 +508,14 @@ class Function(use_metaclass(CachedMetaClass, pr.IsScope)):
     def get_magic_function_scope(self):
         return compiled.magic_function_class
 
-    def is_callable(self):
+    @Python3Method
+    def py__call__(self, evaluator, params):
+        if self.is_generator:
+            return [iterable.Generator(evaluator, self, params)]
+        else:
+            return FunctionExecution(evaluator, self, params).get_return_types()
+
+    def py__bool__(self):
         return True
 
     def __getattr__(self, name):
@@ -406,7 +529,22 @@ class Function(use_metaclass(CachedMetaClass, pr.IsScope)):
         return "<e%s of %s%s>" % (type(self).__name__, self.base_func, dec)
 
 
-class FunctionExecution(Executable):
+class LazyDict(object):
+    def __init__(self, old_dct, copy_func):
+        self._copy_func = copy_func
+        self._old_dct = old_dct
+
+    def __getitem__(self, key):
+        return self._copy_func(self._old_dct[key])
+
+    @underscore_memoization
+    def values(self):
+        # TODO REMOVE this. Not necessary with correct name lookups.
+        for calls in self._old_dct.values():
+            yield self._copy_func(calls)
+
+
+class FunctionExecution(Executed):
     """
     This class is used to evaluate functions and their returns.
 
@@ -415,27 +553,48 @@ class FunctionExecution(Executable):
     multiple calls to functions and recursion has to be avoided. But this is
     responsibility of the decorators.
     """
+    def __init__(self, evaluator, base, *args, **kwargs):
+        super(FunctionExecution, self).__init__(evaluator, base, *args, **kwargs)
+        # for deep_ast_copy
+        self._copy_dict = {base.base_func: self}
+
     @memoize_default(default=())
     @recursion.execution_recursion_decorator
-    def get_return_types(self, evaluate_generator=False):
+    def get_return_types(self):
         func = self.base
-        # Feed the listeners, with the params.
-        for listener in func.listeners:
-            listener.execute(self._get_params())
+
         if func.listeners:
+            # Feed the listeners, with the params.
+            for listener in func.listeners:
+                listener.execute(self._get_params())
             # If we do have listeners, that means that there's not a regular
             # execution ongoing. In this case Jedi is interested in the
             # inserted params, not in the actual execution of the function.
             return []
 
-        if func.is_generator and not evaluate_generator:
-            return [iterable.Generator(self._evaluator, func, self.var_args)]
-        else:
-            stmts = list(docstrings.find_return_types(self._evaluator, func))
-            for r in self.returns:
-                if r is not None:
-                    stmts += self._evaluator.eval_statement(r)
-            return stmts
+        types = list(docstrings.find_return_types(self._evaluator, func))
+        for r in self.returns:
+            if isinstance(r, pr.KeywordStatement):
+                stmt = r.stmt
+            else:
+                stmt = r  # Lambdas
+
+            if stmt is None:
+                continue
+
+            check = flow_analysis.break_check(self._evaluator, self, r.parent)
+            if check is flow_analysis.UNREACHABLE:
+                debug.dbg('Return unreachable: %s', r)
+            else:
+                types += self._evaluator.eval_statement(stmt)
+            if check is flow_analysis.REACHABLE:
+                debug.dbg('Return reachable: %s', r)
+                break
+        return types
+
+    @underscore_memoization
+    def get_names_dict(self):
+        return LazyDict(self.base.get_names_dict(), self._copy_list)
 
     @memoize_default(default=())
     def _get_params(self):
@@ -458,24 +617,17 @@ class FunctionExecution(Executable):
         names = pr.filter_after_position(pr.Scope.get_defined_names(self), position)
         yield self, self._get_params() + names
 
-    def _copy_properties(self, prop):
+    def _copy_list(self, lst):
         """
-        Literally copies a property of a Function. Copying is very expensive,
-        because it is something like `copy.deepcopy`. However, these copied
-        objects can be used for the executions, as if they were in the
+        Copies a list attribute of a parser Function. Copying is very
+        expensive, because it is something like `copy.deepcopy`. However, these
+        copied objects can be used for the executions, as if they were in the
         execution.
         """
-        # Copy all these lists into this local function.
-        attr = getattr(self.base, prop)
         objects = []
-        for element in attr:
-            if element is None:
-                copied = element
-            else:
-                copied = helpers.fast_parent_copy(element)
-                copied.parent = self._scope_copy(copied.parent)
-                if isinstance(copied, pr.Function):
-                    copied = Function(self._evaluator, copied)
+        for element in lst:
+            self._scope_copy(element.parent)
+            copied = helpers.deep_ast_copy(element, self._copy_dict)
             objects.append(copied)
         return objects
 
@@ -484,39 +636,32 @@ class FunctionExecution(Executable):
             raise AttributeError('Tried to access %s: %s. Why?' % (name, self))
         return getattr(self.base, name)
 
-    @memoize_default()
     def _scope_copy(self, scope):
-        """ Copies a scope (e.g. if) in an execution """
-        # TODO method uses different scopes than the subscopes property.
-
-        # just check the start_pos, sometimes it's difficult with closures
-        # to compare the scopes directly.
-        if scope.start_pos == self.start_pos:
-            return self
-        else:
-            copied = helpers.fast_parent_copy(scope)
-            copied.parent = self._scope_copy(copied.parent)
-            return copied
+        """ Copies a scope (e.g. `if foo:`) in an execution """
+        if scope != self.base.base_func:
+            # Just make sure the parents been copied.
+            self._scope_copy(scope.parent)
+            helpers.deep_ast_copy(scope, self._copy_dict)
 
     @common.safe_property
     @memoize_default([])
     def returns(self):
-        return self._copy_properties('returns')
+        return self._copy_list(self.base.returns)
 
     @common.safe_property
     @memoize_default([])
     def asserts(self):
-        return self._copy_properties('asserts')
+        return self._copy_list(self.base.asserts)
 
     @common.safe_property
     @memoize_default([])
     def statements(self):
-        return self._copy_properties('statements')
+        return self._copy_list(self.base.statements)
 
     @common.safe_property
     @memoize_default([])
     def subscopes(self):
-        return self._copy_properties('subscopes')
+        return self._copy_list(self.base.subscopes)
 
     def get_statement_for_position(self, pos):
         return pr.Scope.get_statement_for_position(self, pos)
@@ -525,10 +670,10 @@ class FunctionExecution(Executable):
         return "<%s of %s>" % (type(self).__name__, self.base)
 
 
-class ModuleWrapper(use_metaclass(CachedMetaClass, pr.Module)):
+class ModuleWrapper(use_metaclass(CachedMetaClass, pr.Module, Wrapper)):
     def __init__(self, evaluator, module):
         self._evaluator = evaluator
-        self._module = module
+        self.base = self._module = module
 
     def scope_names_generator(self, position=None):
         yield self, pr.filter_after_position(self._module.get_defined_names(), position)
@@ -539,10 +684,17 @@ class ModuleWrapper(use_metaclass(CachedMetaClass, pr.Module)):
 
     @memoize_default()
     def _module_attributes(self):
+        def parent_callback():
+            return Instance(self._evaluator, compiled.create(self._evaluator, str))
+
         names = ['__file__', '__package__', '__doc__', '__name__', '__version__']
         # All the additional module attributes are strings.
-        parent = Instance(self._evaluator, compiled.create(self._evaluator, str))
-        return [helpers.FakeName(n, parent) for n in names]
+        return [helpers.LazyName(n, parent_callback) for n in names]
+
+    @property
+    @memoize_default()
+    def name(self):
+        return pr.Name(self, unicode(self.base.name), self, (1, 0))
 
     @memoize_default()
     def _sub_modules(self):
@@ -560,6 +712,14 @@ class ModuleWrapper(use_metaclass(CachedMetaClass, pr.Module)):
                 imp = helpers.FakeImport(name, self, level=1)
                 name.parent = imp
                 names.append(name)
+
+        # TODO add something like this in the future, its cleaner than the
+        #   import hacks.
+        # ``os.path`` is a hardcoded exception, because it's a
+        # ``sys.modules`` modification.
+        #if str(self.name) == 'os':
+        #    names.append(helpers.FakeName('path', parent=self))
+
         return names
 
     def __getattr__(self, name):
@@ -567,3 +727,6 @@ class ModuleWrapper(use_metaclass(CachedMetaClass, pr.Module)):
 
     def __repr__(self):
         return "<%s: %s>" % (type(self).__name__, self._module)
+
+    def py__bool__(self):
+        return True

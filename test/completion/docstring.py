@@ -59,9 +59,9 @@ def local_classes(node, node2):
     ... and the class definition after this func definition:
     :type node2: ProgramNode2
     """
-    #? ProgramNode
+    #? ProgramNode()
     node
-    #? ProgramNode2
+    #? ProgramNode2()
     node2
 
 class ProgramNode2():
@@ -83,6 +83,14 @@ def list_with_non_imports(lst):
     lst[1][10]
 
 
+def two_dots(a):
+    """
+    :type a: json.decoder.JSONDecoder
+    """
+    #? ['raw_decode']
+    a.raw_decode
+
+
 # sphinx returns
 def return_module_object():
     """
@@ -91,6 +99,7 @@ def return_module_object():
 
 #? ['join']
 return_module_object().join
+
 
 # -----------------
 # epydoc style
@@ -148,7 +157,7 @@ def both():
     """
     return 23
 
-#? str(), int()
+#? str() int()
 both()
 
 class Test(object):

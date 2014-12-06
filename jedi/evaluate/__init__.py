@@ -68,7 +68,8 @@ backtracking algorithm.
 
 .. todo:: nonlocal statement, needed or can be ignored? (py3k)
 """
-import itertools
+import copy
+from itertools import tee, chain
 
 from jedi._compatibility import next, hasattr, unicode
 from jedi.parser import representation as pr
@@ -84,7 +85,7 @@ from jedi.evaluate import stdlib
 from jedi.evaluate import finder
 from jedi.evaluate import compiled
 from jedi.evaluate import precedence
-from jedi.evaluate.helpers import FakeStatement
+from jedi.evaluate.helpers import FakeStatement, deep_ast_copy
 
 
 class Evaluator(object):
@@ -122,7 +123,7 @@ class Evaluator(object):
         names are defined in the statement, `seek_name` returns the result for
         this name.
 
-        :param stmt: A `pr.Statement`.
+        :param stmt: A `pr.ExprStmt`.
         """
         debug.dbg('eval_statement %s (%s)', stmt, seek_name)
         expression_list = stmt.expression_list()
@@ -133,11 +134,12 @@ class Evaluator(object):
 
         ass_details = stmt.assignment_details
         if ass_details and ass_details[0][1] != '=' and not isinstance(stmt, er.InstanceElement):  # TODO don't check for this.
-            expr_list, operator = ass_details[0]
+            expr_list, _operator = ass_details[0]
             # `=` is always the last character in aug assignments -> -1
-            operator = operator[:-1]
+            operator = copy.copy(_operator)
+            operator.string = operator.string[:-1]
             name = str(expr_list[0].name)
-            parent = stmt.parent
+            parent = stmt.parent.get_parent_until(pr.Flow, reverse=True)
             if isinstance(parent, (pr.SubModule, fast.Module)):
                 parent = er.ModuleWrapper(self, parent)
             left = self.find_types(parent, name, stmt.start_pos)
@@ -167,38 +169,10 @@ class Evaluator(object):
         """
         debug.dbg('eval_expression_list: %s', expression_list)
         p = precedence.create_precedence(expression_list)
-        return self.process_precedence_element(p) or []
-
-    def process_precedence_element(self, el):
-        if el is None:
-            return None
-        else:
-            if isinstance(el, precedence.Precedence):
-                return self._eval_precedence(el)
-            else:
-                # normal element, no operators
-                return self.eval_statement_element(el)
-
-    def _eval_precedence(self, _precedence):
-        left = self.process_precedence_element(_precedence.left)
-        right = self.process_precedence_element(_precedence.right)
-        return precedence.calculate(self, left, _precedence.operator, right)
+        return precedence.process_precedence_element(self, p) or []
 
     def eval_statement_element(self, element):
-        if pr.Array.is_type(element, pr.Array.NOARRAY):
-            try:
-                lst_cmp = element[0].expression_list()[0]
-                if not isinstance(lst_cmp, pr.ListComprehension):
-                    raise IndexError
-            except IndexError:
-                r = list(itertools.chain.from_iterable(self.eval_statement(s)
-                                                       for s in element))
-            else:
-                r = [iterable.GeneratorComprehension(self, lst_cmp)]
-            call_path = element.generate_call_path()
-            next(call_path, None)  # the first one has been used already
-            return self.follow_path(call_path, r, element.parent)
-        elif isinstance(element, pr.ListComprehension):
+        if isinstance(element, pr.ListComprehension):
             return self.eval_statement(element.stmt)
         elif isinstance(element, pr.Lambda):
             return [er.Function(self, element)]
@@ -220,10 +194,10 @@ class Evaluator(object):
 
         # find the statement of the Scope
         s = call
-        while not s.parent.isinstance(pr.IsScope):
+        while not s.parent.is_scope():
             s = s.parent
-        par = s.parent
-        return self.eval_call_path(path, par, s.start_pos)
+        scope = s.parent
+        return self.eval_call_path(path, scope, s.start_pos)
 
     def eval_call_path(self, path, scope, position):
         """
@@ -232,9 +206,20 @@ class Evaluator(object):
         current = next(path)
 
         if isinstance(current, pr.Array):
-            types = [iterable.Array(self, current)]
+            if current.type == pr.Array.NOARRAY:
+                try:
+                    lst_cmp = current[0].expression_list()[0]
+                    if not isinstance(lst_cmp, pr.ListComprehension):
+                        raise IndexError
+                except IndexError:
+                    types = list(chain.from_iterable(self.eval_statement(s)
+                                                     for s in current))
+                else:
+                    types = [iterable.GeneratorComprehension(self, lst_cmp)]
+            else:
+                types = [iterable.Array(self, current)]
         else:
-            if isinstance(current, pr.NamePart):
+            if isinstance(current, pr.Name):
                 # This is the first global lookup.
                 types = self.find_types(scope, current, position=position,
                                         search_global=True)
@@ -254,7 +239,7 @@ class Evaluator(object):
         to follow a call like ``module.a_type.Foo.bar`` (in ``from_somewhere``).
         """
         results_new = []
-        iter_paths = itertools.tee(path, len(types))
+        iter_paths = tee(path, len(types))
 
         for i, typ in enumerate(types):
             fp = self._follow_path(iter_paths[i], typ, call_scope)
@@ -310,65 +295,94 @@ class Evaluator(object):
         return self.follow_path(path, result, scope)
 
     @debug.increase_indent
-    def execute(self, obj, params=(), evaluate_generator=False):
+    def execute(self, obj, params=()):
         if obj.isinstance(er.Function):
             obj = obj.get_decorated_func()
 
         debug.dbg('execute: %s %s', obj, params)
         try:
+            # Some stdlib functions like super(), namedtuple(), etc. have been
+            # hard-coded in Jedi to support them.
             return stdlib.execute(self, obj, params)
         except stdlib.NotInStdLib:
             pass
 
-        if isinstance(obj, iterable.GeneratorMethod):
-            return obj.execute()
-        elif obj.isinstance(compiled.CompiledObject):
-            if obj.is_executable_class():
-                return [er.Instance(self, obj, params)]
-            else:
-                return list(obj.execute_function(self, params))
-        elif obj.isinstance(er.Class):
-            # There maybe executions of executions.
-            return [er.Instance(self, obj, params)]
+        try:
+            func = obj.py__call__
+        except AttributeError:
+            debug.warning("no execution possible %s", obj)
+            return []
         else:
-            stmts = []
-            if obj.isinstance(er.Function):
-                stmts = er.FunctionExecution(self, obj, params).get_return_types(evaluate_generator)
-            else:
-                if hasattr(obj, 'execute_subscope_by_name'):
-                    try:
-                        stmts = obj.execute_subscope_by_name('__call__', params)
-                    except KeyError:
-                        debug.warning("no __call__ func available %s", obj)
-                else:
-                    debug.warning("no execution possible %s", obj)
-
-            debug.dbg('execute result: %s in %s', stmts, obj)
-            return imports.follow_imports(self, stmts)
+            types = func(self, params)
+            debug.dbg('execute result: %s in %s', types, obj)
+            return types
 
     def goto(self, stmt, call_path):
-        scope = stmt.get_parent_until(pr.IsScope)
-        pos = stmt.start_pos
-        call_path, search_name_part = call_path[:-1], call_path[-1]
+        if isinstance(stmt, pr.Import):
+            # Nowhere to goto for aliases
+            if stmt.alias == call_path[0]:
+                return [call_path[0]]
 
-        if call_path:
-            scopes = self.eval_call_path(iter(call_path), scope, pos)
+            names = stmt.get_all_import_names()
+            if stmt.alias:
+                names = names[:-1]
+            # Filter names that are after our Name
+            removed_names = len(names) - names.index(call_path[0]) - 1
+            i = imports.ImportWrapper(self, stmt, kill_count=removed_names,
+                                      nested_resolve=True)
+            return i.follow(is_goto=True)
+
+        # Return the name defined in the call_path, if it's part of the
+        # statement name definitions. Only return, if it's one name and one
+        # name only. Otherwise it's a mixture between a definition and a
+        # reference. In this case it's just a definition. So we stay on it.
+        if len(call_path) == 1 and isinstance(call_path[0], pr.Name) \
+                and call_path[0] in stmt.get_defined_names():
+            # Named params should get resolved to their param definitions.
+            if pr.Array.is_type(stmt.parent, pr.Array.TUPLE, pr.Array.NOARRAY) \
+                    and stmt.parent.previous:
+                call = deep_ast_copy(stmt.parent.previous)
+                # We have made a copy, so we're fine to change it.
+                call.next = None
+                while call.previous is not None:
+                    call = call.previous
+                param_names = []
+                named_param_name = stmt.get_defined_names()[0]
+                for typ in self.eval_call(call):
+                    if isinstance(typ, er.Class):
+                        params = []
+                        for init_method in typ.py__getattribute__('__init__'):
+                            params += init_method.params
+                    else:
+                        params = typ.params
+                    for param in params:
+                        if unicode(param.get_name()) == unicode(named_param_name):
+                            param_names.append(param.get_name())
+                return param_names
+            return [call_path[0]]
+
+        scope = stmt.get_parent_scope()
+        pos = stmt.start_pos
+        first_part, search_name_part = call_path[:-1], call_path[-1]
+
+        if first_part:
+            scopes = self.eval_call_path(iter(first_part), scope, pos)
             search_global = False
             pos = None
         else:
-            # TODO does this exist? i don't think so
             scopes = [scope]
             search_global = True
+
         follow_res = []
         for s in scopes:
             follow_res += self.find_types(s, search_name_part, pos,
                                           search_global=search_global, is_goto=True)
-        return follow_res, search_name_part
+        return follow_res
 
 
 def filter_private_variable(scope, call_scope, var_name):
     """private variables begin with a double underline `__`"""
-    var_name = str(var_name)  # var_name could be a NamePart
+    var_name = str(var_name)  # var_name could be a Name
     if isinstance(var_name, (str, unicode)) and isinstance(scope, er.Instance)\
             and var_name.startswith('__') and not var_name.endswith('__'):
         s = call_scope.get_parent_until((pr.Class, er.Instance, compiled.CompiledObject))
